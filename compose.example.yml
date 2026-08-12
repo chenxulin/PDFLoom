@@ -1,0 +1,16 @@
+# Standalone deployment example. It is intentionally not referenced by the
+# parent repository's deploy.sh / Compose project.
+name: ocr-pdf-agent
+
+services:
+  api:
+    build: .
+    image: ocr-pdf-agent:0.1.0
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:28510:8010"
+    volumes:
+      - ./storage:/data/ocr-pdf-agent
+      - ./cache:/root/.cache
