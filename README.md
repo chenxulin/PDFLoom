@@ -1,128 +1,117 @@
-# PDF-Loom
+# PDFLoom
 
-这是从原系统中独立抽取出的 PDF 翻译服务。它不连接原项目数据库、不依赖
-OnlyOffice，也不导入原项目的 `server` 包。原项目代码保持不变。
+> 面向医药 / CMC 文档的**版式保真 PDF 翻译服务**：自动识别原生、扫描、旧 OCR 层和混合 PDF，输出可搜索的单语 / 双语 PDF，并保留完整审计链路。
 
-## 处理路径
+PDFLoom 不只是把 PDF 文本交给大模型，而是解决扫描文档翻译中的三个核心问题：**如何选对处理链路、如何保证数字与术语不被改写、如何在翻译后保住原始版式和复杂表格**。
 
-服务会检查 PDF 的每一页，不只看首页：
+**双形态交付：**同一套能力既通过 FastAPI / CLI 支持自动化处理，也沉淀为 [`pdf-translator`](skills/pdf-translator/SKILL.md) Codex Skill。Skill 将自然语言任务编排为 `prepare → template → guide → build → verify → render`，项目渲染器兼容其 schema v1 布局协议。
 
-- 扫描件、带旧 OCR 隐藏层的扫描件、扫描/文字混合件：
-  `PaddleOCR PP-StructureV3 → 清洁 OCR 源文层 → PDFMathTranslate → 逐页串行 LLM → OCR ledger → layout.json → 原页背景保留渲染 → 表格矢量重绘 → 严格验证`
-- 纯文字件：
-  `PDFMathTranslate（内含 LLM 翻译与版面回填）`
+## 核心亮点
 
-扫描路径中的表格不会写入 OCR 中间文字层，避免 PDFMathTranslate 与表格专用
-逻辑重复处理。服务读取 PP-StructureV3 的 HTML/Markdown 表格结构，保留
-`rowspan` / `colspan`，锁定数字、日期、百分比、单位、化学式和标识符，只翻译
-说明文字，然后清除整张源表并重绘为可搜索的矢量表格。默认从 9 pt、1.25 倍
-行距排版；原页空间不足时按完整数据行分页并重复表头，不通过缩小文字掩盖溢出。
-仍无法安全容纳则明确失败，不输出串列或溢出的交付件。签字/日期类表格默认保持
-原图，避免破坏手写内容。
+| 功能 | 如何实现 | 解决的问题 |
+| --- | --- | --- |
+| **全文级智能路由** | 使用 PyMuPDF 检查每一页的文字量、文本块、图片数量和图片覆盖率，将文档识别为原生、扫描、可搜索扫描或混合 PDF；原生 PDF 直达 PDFMathTranslate，任一页需要 OCR 时进入扫描链路 | 避免只看首页导致扫描附件漏译，也避免原生 PDF 被无意义 OCR |
+| **干净的 OCR 中间层** | 调用 PaddleOCR PP-StructureV3 获取文字块、语义区域和表格结构；清除旧 OCR 隐藏层，只回填正文与标题，主动跳过表格、公式、图片、印章和低置信噪点 | 防止旧文字层、图片文字和表格内容被重复翻译 |
+| **上下文串行翻译** | 按“页码 + 阅读顺序”逐段翻译，为模型提供前后段落、表头、当前行和文档片段；数据密集段落按标点拆分，失败时继续细分重试 | 减少跨段语义不一致、短标签误译和大段数据遗漏 |
+| **数据完整性保护** | 翻译前将日期、数值、百分比、单位、化学式、批号和缩写替换为受保护占位符；翻译后逐项校验并恢复，缺失或被改写时任务失败 | 防止 `99.5%`、`A-001`、`mg/mL` 等关键事实被大模型修改 |
+| **复杂表格矢量重建** | 解析 OCR 返回的 HTML / Markdown 表格，保留 `rowspan`、`colspan`；结合表头、列头、当前行和全文上下文翻译单元格，再清除整张源表并绘制可搜索矢量表格 | 避免译文覆盖原表、表格错列和数据串行 |
+| **长表格自动分页** | 固定使用 9 pt、1.25 倍行距排版；空间不足时按完整数据行分页并重复表头，绝不通过无限缩小字体掩盖溢出；签字 / 日期表保留原图 | 保证长表可读、行列完整，并保护手写签名 |
+| **医药术语与严格 QA** | 内置 CMC 术语约束和 OCR 纠错，如 `Assay → 含量测定`、`release → 放行`、`0OS → OOS`；最终校验目标语言、译文完整性、术语、页面尺寸、文字边界和非翻译区域背景相似度 | 对疑似未翻译、误译、越界或破版结果执行 fail-closed，不把坏文件当成功结果交付 |
+| **Codex Skill 工程化** | 将完整的版式保真方法封装为 `pdf-translator` Skill：强制逐页内容台账、领域术语优先级、坐标化布局、溢出即失败，以及机械验证后的逐页视觉复核 | 把一次性提示词和脚本升级为可复用、可审计、质量标准一致的 Agent 工作流 |
+| **异步任务与可审计产物** | FastAPI 接收任务，`asyncio.Semaphore` 控制并发；原子更新任务清单，记录阶段进度、耗时、SHA-256、OCR JSON、翻译台账、布局文件和验证报告 | 支持服务化部署、问题定位和结果追溯 |
 
-正文和标题按 PP-StructureV3 的段落区域重新聚合，不按每条 OCR 短行分别回填；
-这样可以避免中文短行翻成英文后出现断词、窄框裁切。若 PDFMathTranslate 把相邻
-段落合并成一个文字框，重绘阶段会在 OCR 坐标仍可无歧义对应时拆回完整译文段落，
-否则任务明确失败。页眉、页脚、页码和图形区域继续按语义单独保护。
+## 处理架构
 
-扫描路径会从 `translation_ledger.json` 自动生成 PDF Translator schema v1
-兼容的 `layout.json`。原始页面以 300 DPI 背景保留，只覆盖正文和标题的 OCR
-坐标框并写入可搜索译文；表格框在此阶段保持原样，随后交给现有矢量表格模块完整
-替换。验证器检查每个原始页的尺寸映射、逐元素可搜索译文、文字边界，以及翻译框和
-表格重绘区域之外的背景相似度。表格续页是显式允许的扩展页，正文和普通区域仍固定
-在其原始页坐标内。
-
-本仓库面向原系统的医药/CMC 场景，默认启用 `ENFORCE_CMC_TERMINOLOGY=true`。
-短表格标签会结合表头、同行单元格和全文片段翻译；高风险术语还会做强制验收，
-例如质控项目 `Assay → 含量测定`、批次处置语境中的
-`release/released → 放行/批准放行`。模型首次违反术语约束时会带着更强上下文重试，
-仍不合格则任务失败，不把“检测”“发布”等误译作为成功结果交付。只有另行配置了
-通用领域提示词和 QA 的部署才应关闭这一开关。
-
-对中文扫描件还会在进入翻译前修正高置信度的 `0OS` / `00S` / `O0S → OOS`
-识别混淆；常见 CMC 表头和章节名使用精确目标词约束，例如
-`产品批号 → Batch No.`、`TOC平行样/ppb → TOC parallel samples/ppb`、
-`检验用具 → Test Utensils`。
-
-## 目录
-
-```text
-ocr_pdf_agent/
-├── src/ocr_pdf_agent/     # 分类、OCR、PDFMathTranslate、LLM、回填和 API
-├── tests/                 # 扫描件/文字件及表格重绘自动测试
-├── scripts/               # 样本生成与双路径 smoke test
-├── storage/               # 默认任务存储（Git 忽略内容）
-├── Dockerfile
-└── compose.example.yml    # 独立部署示例，不接入父项目 deploy.sh
+```mermaid
+flowchart LR
+    A["PDF 输入"] --> B{"逐页分类"}
+    B -->|"原生 PDF"| C["PDFMathTranslate"]
+    B -->|"扫描 / 旧 OCR / 混合 PDF"| D["PaddleOCR PP-StructureV3"]
+    D --> E["清洁 OCR 文本层"]
+    E --> C
+    C -->|"扫描链路"| F["按阅读顺序的上下文翻译"]
+    F --> G["坐标台账与原背景回填"]
+    G --> H["矢量表格重建与分页"]
+    C -->|"原生链路"| I["严格输出验证"]
+    H --> I
+    I --> J["可搜索 PDF + 审计产物"]
 ```
 
-## 配置
+扫描链路会把每个正文段落、标题和表格单元格的**坐标、原文、译文及受保护数据**写入 `translation_ledger.json`，再生成布局文件并以原页 300 DPI 背景进行局部回填。默认要求非翻译区域背景相似度不低于 `0.985`。
+
+## 技术栈
+
+| 类别 | 技术 |
+| --- | --- |
+| 语言与并发 | Python 3.11–3.12、asyncio |
+| API 服务 | FastAPI、Uvicorn、Pydantic Settings、HTTPX |
+| PDF 处理 | PyMuPDF、PDFMathTranslate / pdf2zh 1.9.11 |
+| OCR | PaddleOCR PP-StructureV3（远程服务） |
+| 大模型 | OpenAI-compatible Chat Completions API |
+| Agent 工程化 | Codex Skill、SKILL.md 工作流、schema v1 布局协议 |
+| 工程化 | Docker、Docker Compose、磁盘任务状态、SHA-256 审计 |
+| 质量保障 | pytest、pytest-asyncio、Ruff |
+
+## 快速开始
+
+### Docker
 
 ```bash
 cp .env.example .env
-chmod 600 .env
+# 填写 API_KEY、BASE_URL、MODEL_NAME、PADDLEOCR_API_URL 和 PADDLEOCR_SERVICE_TOKEN
+docker compose -f compose.example.yml up --build
 ```
 
-至少配置：
+服务默认监听 `http://127.0.0.1:28510`。
 
-- `API_KEY`、`BASE_URL`、`MODEL_NAME`：OpenAI-compatible 翻译模型。
-- `PADDLEOCR_SERVICE_TOKEN`：远端 PaddleOCR 的独立服务令牌。
-- `PADDLEOCR_API_URL`：默认沿用 `http://192.168.1.88:18093`。
-
-对外或跨服务调用时应设置 `SERVICE_API_TOKEN`；设置后，所有 `/v1/*` 请求必须
-携带 `X-OCR-PDF-Agent-Token`。`/health` 保持无鉴权，且只返回配置是否就绪，
-不返回任何密钥。
-
-服务也兼容迁移期变量 `ATTACHMENT_OCR_SERVICE_TOKEN`，但不会打印或返回令牌。
-
-`BASE_URL` 和 `MODEL_NAME` 没有任何代码默认值或备用模型；两项必须在运行环境中
-明确设置。缺失、为空或 URL 格式错误时，服务会直接拒绝启动，绝不会自动切换到
-DeepSeek 公网接口或其他模型。
-
-## 本地运行
+### 本地运行
 
 ```bash
 python -m venv .venv
-. .venv/bin/activate
+source .venv/bin/activate
 pip install -e '.[test]'
 ocr-pdf-agent serve --port 8010
 ```
 
-父仓库所在计算节点没有宿主机 Python 时，可构建独立镜像；`compose.example.yml`
-只是部署模板，不属于父项目 `joincare-translate-compute`，不要用父项目的
-`deploy.sh` 管理它。
+## 使用方式
 
-## HTTP API
+### Codex Skill
 
-上传任务：
+仓库已包含完整 Skill 源码、执行脚本和版式 / 领域规则：[`skills/pdf-translator/`](skills/pdf-translator/)。安装后即可通过自然语言触发完整工作流。
 
 ```bash
-curl -F 'file=@document.pdf;type=application/pdf' \
-  -F 'source_language=auto' \
-  -F 'target_language=zh-CN' \
+mkdir -p ~/.codex/skills
+cp -R skills/pdf-translator ~/.codex/skills/
+python3 -m pip install -r skills/pdf-translator/requirements.txt
+```
+
+示例提示词：`使用 $pdf-translator 将这份 PDF 翻译为英文，并保持原始版式。`
+
+### HTTP API
+
+```bash
+# 创建翻译任务
+curl -X POST http://127.0.0.1:28510/v1/jobs \
   -H 'X-OCR-PDF-Agent-Token: <service-token>' \
-  http://127.0.0.1:8010/v1/jobs
+  -F 'file=@document.pdf;type=application/pdf' \
+  -F 'source_language=auto' \
+  -F 'target_language=zh-CN'
+
+# 查询状态并下载结果
+curl -H 'X-OCR-PDF-Agent-Token: <service-token>' \
+  http://127.0.0.1:28510/v1/jobs/<job_id>
+curl -OJ -H 'X-OCR-PDF-Agent-Token: <service-token>' \
+  http://127.0.0.1:28510/v1/jobs/<job_id>/artifacts/translated
 ```
 
-查询与下载：
+| Endpoint | 说明 |
+| --- | --- |
+| `GET /health` | 服务及依赖配置状态 |
+| `POST /v1/jobs` | 上传 PDF，异步创建翻译任务 |
+| `GET /v1/jobs/{job_id}` | 查询阶段、进度、耗时和结果 |
+| `GET /v1/jobs/{job_id}/artifacts/{name}` | 下载 PDF 或审计产物 |
 
-```bash
-curl http://127.0.0.1:8010/v1/jobs/<job_id>
-curl -O http://127.0.0.1:8010/v1/jobs/<job_id>/artifacts/translated
-curl -O http://127.0.0.1:8010/v1/jobs/<job_id>/artifacts/bilingual
-```
-
-可下载的 artifact 名称为：`translated`、`bilingual`、`manifest`、`ocr`、
-`ocr-input`、`ledger`、`layout`、`layout-render-report`、
-`layout-verification`、`source`。扫描任务的 `ledger` 按完整正文段落、标题和
-表格单元格记录坐标、原文、译文及受保护字面量；每个任务目录还保留分类证据、
-OCR JSON、中间 PDF、最终 PDF、SHA-256 和分阶段耗时，便于排错与审计。
-
-默认启用 `STRICT_OUTPUT_QA=true`：目标语脚本缺失、输出无文字或译文与原文
-几乎相同、或源文命中的强制 CMC 术语未出现在译文中时，任务会失败而不会把疑似
-未翻译/误译文件作为成功结果交付。
-
-## CLI
+### CLI
 
 ```bash
 ocr-pdf-agent classify input.pdf
@@ -130,32 +119,25 @@ ocr-pdf-agent translate input.pdf --source-language auto \
   --target-language zh-CN --output-dir ./output
 ```
 
+## 输出产物
+
+- `translated.pdf` / `bilingual.pdf`：可搜索的单语 / 双语译文。
+- `manifest.json`：任务状态、阶段耗时、校验结果和文件哈希。
+- `ocr_ppstructurev3.json`：结构化 OCR 原始结果。
+- `translation_ledger.json`：带坐标和受保护数据的翻译台账。
+- `layout.json` / `layout_verification.json`：版式描述与严格验证报告。
+
 ## 测试
 
-离线测试不调用外部服务，但会真实生成扫描型 PDF 和文字型 PDF、执行路由、
-生成 OCR 中间层并验证表格矢量重绘：
-
 ```bash
-PYTHONPATH=src python -m unittest discover -v
-PYTHONPATH=src:. python scripts/run_smoke.py --offline \
-  --output-dir test-results/offline-smoke
+pytest -q
+ruff check .
 ```
 
-配置真实 OCR/LLM 后执行双路径端到端测试：
+当前自动化测试覆盖：双链路路由、OCR 常见错误修复、数据占位符保护、术语强校验、`rowspan` / `colspan`、正文与标题排版、长表分页、背景相似度及越界检测。
 
-```bash
-PYTHONPATH=src:. python scripts/run_smoke.py \
-  --output-dir test-results/live-smoke
-```
+## 项目边界
 
-扫描件 smoke test 除了检查路由、OCR、正文回填和表格重绘，还会从最终 PDF 反向
-提取文字，强制确认含有“含量测定”“放行”和原始数值 `99.5`，并确认不含
-“检测”“发布”以及残留英文 `Assay` / `Reviewed for release`。
-
-## 边界与许可证
-
-- 该服务只接受 PDF，不负责 Word/Excel/OnlyOffice。
-- OCR 仍是远端依赖；本项目不会创建、启动、删除或重建 PaddleOCR。
-- PDFMathTranslate/pdf2zh 1.9.11 使用 AGPL-3.0，上线或对外分发前应完成相应
-  许可证合规评估。
->>>>>>> b775206 (PDF Translate tools)
+- 仅处理 PDF，不负责 Word、Excel 或 OnlyOffice 文档。
+- OCR 与大模型为外部依赖；服务本身不依赖数据库。
+- `pdf2zh 1.9.11` 使用 AGPL-3.0，对外分发或商用部署前需完成许可证合规评估。

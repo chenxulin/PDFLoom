@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF Translator"
+  short_description: "Layout-faithful searchable PDF translation"
+  default_prompt: "Use $pdf-translator to translate this PDF while preserving its original page layout as closely as possible."
