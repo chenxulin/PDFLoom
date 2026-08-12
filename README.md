@@ -2,10 +2,6 @@
 
 > 面向医药 / CMC 文档的**版式保真 PDF 翻译服务**：自动识别原生、扫描、旧 OCR 层和混合 PDF，输出可搜索的单语 / 双语 PDF，并保留完整审计链路。
 
-PDFLoom 不只是把 PDF 文本交给大模型，而是解决扫描文档翻译中的三个核心问题：**如何选对处理链路、如何保证数字与术语不被改写、如何在翻译后保住原始版式和复杂表格**。
-
-**双形态交付：**同一套能力既通过 FastAPI / CLI 支持自动化处理，也沉淀为 [`pdf-translator`](skills/pdf-translator/SKILL.md) Codex Skill。Skill 将自然语言任务编排为 `prepare → template → guide → build → verify → render`，项目渲染器兼容其 schema v1 布局协议。
-
 ## 核心亮点
 
 | 功能 | 如何实现 | 解决的问题 |
@@ -20,34 +16,15 @@ PDFLoom 不只是把 PDF 文本交给大模型，而是解决扫描文档翻译�
 | **Codex Skill 工程化** | 将完整的版式保真方法封装为 `pdf-translator` Skill：强制逐页内容台账、领域术语优先级、坐标化布局、溢出即失败，以及机械验证后的逐页视觉复核 | 把一次性提示词和脚本升级为可复用、可审计、质量标准一致的 Agent 工作流 |
 | **异步任务与可审计产物** | FastAPI 接收任务，`asyncio.Semaphore` 控制并发；原子更新任务清单，记录阶段进度、耗时、SHA-256、OCR JSON、翻译台账、布局文件和验证报告 | 支持服务化部署、问题定位和结果追溯 |
 
-## 处理架构
-
-```mermaid
-flowchart LR
-    A["PDF 输入"] --> B{"逐页分类"}
-    B -->|"原生 PDF"| C["PDFMathTranslate"]
-    B -->|"扫描 / 旧 OCR / 混合 PDF"| D["PaddleOCR PP-StructureV3"]
-    D --> E["清洁 OCR 文本层"]
-    E --> C
-    C -->|"扫描链路"| F["按阅读顺序的上下文翻译"]
-    F --> G["坐标台账与原背景回填"]
-    G --> H["矢量表格重建与分页"]
-    C -->|"原生链路"| I["严格输出验证"]
-    H --> I
-    I --> J["可搜索 PDF + 审计产物"]
-```
-
-扫描链路会把每个正文段落、标题和表格单元格的**坐标、原文、译文及受保护数据**写入 `translation_ledger.json`，再生成布局文件并以原页 300 DPI 背景进行局部回填。默认要求非翻译区域背景相似度不低于 `0.985`。
-
 ## 技术栈
 
 | 类别 | 技术 |
 | --- | --- |
-| 语言与并发 | Python 3.11–3.12、asyncio |
+| 语言与并发 | Python 3.12、asyncio |
 | API 服务 | FastAPI、Uvicorn、Pydantic Settings、HTTPX |
 | PDF 处理 | PyMuPDF、PDFMathTranslate / pdf2zh 1.9.11 |
 | OCR | PaddleOCR PP-StructureV3（远程服务） |
-| 大模型 | OpenAI-compatible Chat Completions API |
+| 大模型 | DeepSeek、Openai、Kimi、GLM等 |
 | Agent 工程化 | Codex Skill、SKILL.md 工作流、schema v1 布局协议 |
 | 工程化 | Docker、Docker Compose、磁盘任务状态、SHA-256 审计 |
 | 质量保障 | pytest、pytest-asyncio、Ruff |
@@ -126,16 +103,6 @@ ocr-pdf-agent translate input.pdf --source-language auto \
 - `ocr_ppstructurev3.json`：结构化 OCR 原始结果。
 - `translation_ledger.json`：带坐标和受保护数据的翻译台账。
 - `layout.json` / `layout_verification.json`：版式描述与严格验证报告。
-
-## 测试
-
-```bash
-pytest -q
-ruff check .
-```
-
-当前自动化测试覆盖：双链路路由、OCR 常见错误修复、数据占位符保护、术语强校验、`rowspan` / `colspan`、正文与标题排版、长表分页、背景相似度及越界检测。
-
 ## 项目边界
 
 - 仅处理 PDF，不负责 Word、Excel 或 OnlyOffice 文档。
