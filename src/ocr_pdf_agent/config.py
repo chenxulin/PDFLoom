@@ -8,8 +8,6 @@ settings object can be logged without revealing credentials.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
-
 from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -69,6 +67,15 @@ class Settings(BaseSettings):
     ocr_service_token: SecretStr = SecretStr("")
     paddleocr_timeout_seconds: float = Field(default=3600.0, gt=0)
     paddleocr_attempts: int = Field(default=2, ge=1, le=3)
+    # Keep the standalone service aligned with Joincare's remote OCR contract:
+    # only the OCR proxy is downsampled, requests are globally bounded, and
+    # normalized results can be safely reused from the disk cache.
+    paddleocr_max_concurrent_requests: int = Field(default=2, ge=1, le=20)
+    paddleocr_proxy_target_dpi: int = Field(default=600, ge=72, le=1200)
+    paddleocr_downsample_threshold_dpi: int = Field(default=600, ge=72, le=2400)
+    paddleocr_cache_enabled: bool = True
+    paddleocr_cache_dir: Path | None = None
+    paddleocr_orientation_retry: bool = True
 
     pdfmathtranslate_max_attempts: int = Field(
         default=3,
@@ -83,13 +90,6 @@ class Settings(BaseSettings):
     ignore_translation_cache: bool = False
     strict_output_qa: bool = True
 
-    layout_background_dpi: int = Field(default=300, ge=144, le=600)
-    layout_similarity_dpi: int = Field(default=36, ge=24, le=144)
-    layout_similarity_margin: float = Field(default=2.0, ge=0.0, le=12.0)
-    layout_min_similarity: float = Field(default=0.985, ge=0.9, le=1.0)
-    layout_body_font_size: float = Field(default=9.0, ge=6.0, le=16.0)
-    layout_body_min_font_size: float = Field(default=6.0, ge=4.0, le=12.0)
-
     storage_dir: Path = PROJECT_ROOT / "storage"
     max_upload_mib: int = Field(default=200, ge=1, le=2048)
     max_concurrent_jobs: int = Field(default=2, ge=1, le=20)
@@ -100,14 +100,6 @@ class Settings(BaseSettings):
     table_line_height: float = Field(default=1.25, ge=1.0, le=2.0)
     regular_font_path: Path = Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc")
     bold_font_path: Path = Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc")
-
-    @field_validator("layout_body_min_font_size")
-    @classmethod
-    def validate_layout_min_font_size(cls, value: float, info: Any) -> float:
-        requested = info.data.get("layout_body_font_size")
-        if requested is not None and value > float(requested):
-            raise ValueError("LAYOUT_BODY_MIN_FONT_SIZE must not exceed LAYOUT_BODY_FONT_SIZE")
-        return value
 
     @field_validator("base_url", "paddleocr_api_url")
     @classmethod

@@ -7,7 +7,6 @@ model request.  This module builds one page ledger, walks it top-to-bottom with
 one in-flight request, and splits only data-dense prose at punctuation before
 assembling the final body and table plans.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -52,6 +51,25 @@ _MAX_BODY_CHARS_PER_REQUEST = 240
 _MAX_INTEGRITY_RETRY_CHARS = 120
 _WORKSHOP_DIGITS = str.maketrans("〇零一二三四五六七八九", "00123456789")
 _WORKSHOP_NUMBER_RE = re.compile(r"[〇零一二三四五六七八九](?=车间)")
+_HEADING_PRESERVED_ACRONYMS = frozenset(
+    {
+        "API",
+        "CAPA",
+        "GMP",
+        "HPLC",
+        "ICH",
+        "N/A",
+        "ND",
+        "OOT",
+        "OOS",
+        "QA",
+        "QC",
+        "RRT",
+        "RT",
+        "SOP",
+        "USP",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -85,6 +103,33 @@ def _normalize_workshop_numbers(text: str) -> str:
     )
 
 
+def _protect_heading_values(text: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Protect factual heading values without masking every uppercase word.
+
+    The shared table-value matcher deliberately treats uppercase strings as
+    protected because table cells frequently contain acronyms or formulae. A
+    document title such as ``QUALITY CONTROL REPORT`` is different: masking
+    every word leaves the model nothing to translate and makes the target
+    language integrity check fail. Keep known CMC acronyms, identifiers,
+    numbers, formulae, and lone variables exact; return ordinary all-uppercase
+    heading words to the model as translatable prose.
+    """
+    protected_text, protected_values = _protect_values(text)
+    retained: list[tuple[str, str]] = []
+    for placeholder, value in protected_values:
+        compact = value.strip()
+        preserve = (
+            compact.upper() in _HEADING_PRESERVED_ACRONYMS
+            or bool(re.fullmatch(r"[A-Z]", compact))
+            or not bool(re.fullmatch(r"[A-Z]+", compact))
+        )
+        if preserve:
+            retained.append((placeholder, value))
+        else:
+            protected_text = protected_text.replace(placeholder, value)
+    return protected_text, tuple(retained)
+
+
 def _hard_split_slot_dense_piece(piece: str) -> list[str]:
     matches = list(_VISIBLE_SLOT_RE.finditer(piece))
     if len(matches) <= _MAX_BODY_SLOTS_PER_REQUEST:
@@ -111,7 +156,11 @@ def _split_data_dense_body(text: str) -> tuple[str, ...]:
     raw_pieces = _CLAUSE_RE.findall(text)
     if not raw_pieces or "".join(raw_pieces) != text:
         raw_pieces = [text]
-    pieces = [part for piece in raw_pieces for part in _hard_split_slot_dense_piece(piece)]
+    pieces = [
+        part
+        for piece in raw_pieces
+        for part in _hard_split_slot_dense_piece(piece)
+    ]
     fragments: list[str] = []
     current = ""
     current_slots = 0
@@ -127,7 +176,10 @@ def _split_data_dense_body(text: str) -> tuple[str, ...]:
             current_slots = 0
         current += piece
         current_slots += piece_slots
-        if current_slots >= _MAX_BODY_SLOTS_PER_REQUEST or len(current) >= _MAX_BODY_CHARS_PER_REQUEST:
+        if (
+            current_slots >= _MAX_BODY_SLOTS_PER_REQUEST
+            or len(current) >= _MAX_BODY_CHARS_PER_REQUEST
+        ):
             fragments.append(current)
             current = ""
             current_slots = 0
@@ -140,7 +192,11 @@ def _fragment_values(
     fragment: str,
     values: tuple[tuple[str, str], ...],
 ) -> tuple[tuple[str, str], ...]:
-    return tuple((placeholder, value) for placeholder, value in values if placeholder[2:-2] in fragment)
+    return tuple(
+        (placeholder, value)
+        for placeholder, value in values
+        if placeholder[2:-2] in fragment
+    )
 
 
 def _join_fragments(parts: list[str], target_language: str) -> str:
@@ -193,7 +249,11 @@ def _split_placeholder_integrity_retry(text: str) -> tuple[str, ...]:
                     boundary,
                 )
             )
-    split_at = min(candidates)[2] if candidates else slots[(len(slots) - 1) // 2].end()
+    split_at = (
+        min(candidates)[2]
+        if candidates
+        else slots[(len(slots) - 1) // 2].end()
+    )
     left, right = text[:split_at], text[split_at:]
     if not left.strip() or not right.strip():
         return (text,)
@@ -331,15 +391,27 @@ async def _translate_with_integrity_fallback(
             translated_pieces: list[str] = []
             for piece_idx, piece in enumerate(pieces):
                 piece_values = _fragment_values(piece, values)
-                piece_source = _restore_values(piece, piece_values) if piece_values else piece
+                piece_source = (
+                    _restore_values(piece, piece_values)
+                    if piece_values
+                    else piece
+                )
                 translated_pieces.append(
                     await _translate_with_integrity_fallback(
                         client=client,
                         text=piece,
                         source_for_validation=piece_source,
                         values=piece_values,
-                        context_prev=(pieces[piece_idx - 1] if piece_idx else context_prev),
-                        context_next=(pieces[piece_idx + 1] if piece_idx + 1 < len(pieces) else context_next),
+                        context_prev=(
+                            pieces[piece_idx - 1]
+                            if piece_idx
+                            else context_prev
+                        ),
+                        context_next=(
+                            pieces[piece_idx + 1]
+                            if piece_idx + 1 < len(pieces)
+                            else context_next
+                        ),
                         settings=settings,
                         seg_type=seg_type,
                         retry_reason=retry_reason,
@@ -355,7 +427,9 @@ async def _translate_with_integrity_fallback(
                 translated,
                 settings.target_language,
             ):
-                raise ValueError("分治译文未完整翻译到目标语言") from integrity_error
+                raise ValueError(
+                    "分治译文未完整翻译到目标语言"
+                ) from integrity_error
             return translated
         if len(values) == 1:
             return await _translate_single_raw_value(
@@ -384,7 +458,9 @@ async def translate_ocr_content_serially(
     body_results: list[OcrBodyRegionTranslation | None] = [None] * len(body_regions)
     heading_regions = _normalise_heading_regions(ocr_result)
     heading_sources = _heading_source_texts(ocr_result, heading_regions)
-    heading_results: list[OcrHeadingRegionTranslation | None] = [None] * len(heading_regions)
+    heading_results: list[OcrHeadingRegionTranslation | None] = [
+        None
+    ] * len(heading_regions)
 
     tables = extract_ocr_tables(ocr_result)
     mutable_cells = [list(table.cells) for table in tables]
@@ -392,7 +468,9 @@ async def translate_ocr_content_serially(
     locked_table_values = 0
     items: list[_ContentItem] = []
 
-    for body_idx, (region, source) in enumerate(zip(body_regions, body_sources, strict=True)):
+    for body_idx, (region, source) in enumerate(
+        zip(body_regions, body_sources, strict=True)
+    ):
         translatable = _needs_translation(source, settings.target_language)
         if not translatable:
             body_results[body_idx] = OcrBodyRegionTranslation(
@@ -414,7 +492,9 @@ async def translate_ocr_content_serially(
             )
         )
 
-    for heading_idx, (region, source) in enumerate(zip(heading_regions, heading_sources, strict=True)):
+    for heading_idx, (region, source) in enumerate(
+        zip(heading_regions, heading_sources, strict=True)
+    ):
         translatable = _needs_translation(source, settings.target_language)
         if not translatable:
             heading_results[heading_idx] = OcrHeadingRegionTranslation(
@@ -450,7 +530,11 @@ async def translate_ocr_content_serially(
             )
             if not translatable:
                 preserved_table_cells += 1
-                if not table.preserve_as_image and cell.source_text and _is_locked_value(cell.source_text):
+                if (
+                    not table.preserve_as_image
+                    and cell.source_text
+                    and _is_locked_value(cell.source_text)
+                ):
                     locked_table_values += 1
             items.append(
                 _ContentItem(
@@ -495,7 +579,11 @@ async def translate_ocr_content_serially(
             if not item.translatable:
                 continue
             previous = ordered[position - 1].source if position else ""
-            following = ordered[position + 1].source if position + 1 < len(ordered) else ""
+            following = (
+                ordered[position + 1].source
+                if position + 1 < len(ordered)
+                else ""
+            )
             if item.kind in {"body", "heading"}:
                 if item.kind == "body":
                     assert item.body_idx is not None
@@ -510,15 +598,25 @@ async def translate_ocr_content_serially(
                     content_label = "标题"
                     retry_reason = "ocr_heading_placeholder_integrity"
                 normalized_source = _normalize_workshop_numbers(item.source)
-                protected_text, values = _protect_values(normalized_source)
+                protected_text, values = (
+                    _protect_heading_values(normalized_source)
+                    if item.kind == "heading"
+                    else _protect_values(normalized_source)
+                )
                 exposed_text = _expose_values(protected_text, values)
                 fragments = _split_data_dense_body(exposed_text)
                 translated_fragments: list[str] = []
                 for fragment_idx, fragment in enumerate(fragments):
                     fragment_values = _fragment_values(fragment, values)
-                    fragment_previous = fragments[fragment_idx - 1] if fragment_idx else previous
+                    fragment_previous = (
+                        fragments[fragment_idx - 1]
+                        if fragment_idx
+                        else previous
+                    )
                     fragment_following = (
-                        fragments[fragment_idx + 1] if fragment_idx + 1 < len(fragments) else following
+                        fragments[fragment_idx + 1]
+                        if fragment_idx + 1 < len(fragments)
+                        else following
                     )
                     try:
                         translated_fragment = await _translate_with_integrity_fallback(
@@ -548,7 +646,9 @@ async def translate_ocr_content_serially(
                     translated,
                     settings.target_language,
                 ):
-                    raise error_type(f"第 {region.page_idx + 1} 页{content_label}未完整翻译到目标语言")
+                    raise error_type(
+                        f"第 {region.page_idx + 1} 页{content_label}未完整翻译到目标语言"
+                    )
                 preferred = exact_preferred_target(
                     item.source,
                     settings.target_language,
@@ -645,7 +745,10 @@ async def translate_ocr_content_serially(
     body_plan = OcrBodyTranslationPlan(
         completed_body,
         len(body_regions),
-        sum(_needs_translation(source, settings.target_language) for source in body_sources),
+        sum(
+            _needs_translation(source, settings.target_language)
+            for source in body_sources
+        ),
         sum(len(item.protected_values) for item in completed_body),
     )
     completed_headings = tuple(item for item in heading_results if item is not None)
@@ -654,11 +757,15 @@ async def translate_ocr_content_serially(
     heading_plan = OcrHeadingTranslationPlan(
         completed_headings,
         len(heading_regions),
-        sum(_needs_translation(source, settings.target_language) for source in heading_sources),
+        sum(
+            _needs_translation(source, settings.target_language)
+            for source in heading_sources
+        ),
         sum(len(item.protected_values) for item in completed_headings),
     )
     translated_tables = tuple(
-        replace(table, cells=tuple(mutable_cells[index])) for index, table in enumerate(tables)
+        replace(table, cells=tuple(mutable_cells[index]))
+        for index, table in enumerate(tables)
     )
     table_plan = OcrTableTranslationPlan(
         tables=translated_tables,

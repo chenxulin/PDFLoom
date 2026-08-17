@@ -57,14 +57,6 @@ async def _translate(args: argparse.Namespace) -> None:
                     str(result.artifacts.bilingual_pdf) if result.artifacts.bilingual_pdf else None
                 ),
                 "manifest": str(result.artifacts.manifest),
-                "layout_json": (
-                    str(result.artifacts.layout_json) if result.artifacts.layout_json else None
-                ),
-                "layout_verification": (
-                    str(result.artifacts.layout_verification)
-                    if result.artifacts.layout_verification
-                    else None
-                ),
                 "body_stats": result.body_stats.__dict__,
                 "table_stats": result.table_stats.__dict__,
             },

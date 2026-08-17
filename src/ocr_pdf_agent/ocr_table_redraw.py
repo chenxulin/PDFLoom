@@ -7,10 +7,10 @@ identifiers before model translation, removes the complete source table on the
 translated page, and draws a fresh searchable vector table.  It never places
 translated strings on top of the source table image.
 """
-
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import re
@@ -38,6 +38,8 @@ from .ocr_pdf_coordinates import (
 from .ocr_semantics import canonical_ocr_type, is_furniture_region_type
 from .translator import _build_client, translate_chunk
 
+logger = logging.getLogger(__name__)
+
 _TABLE_FONT_SIZE = 9.0
 _TABLE_LINE_HEIGHT = 1.25
 _CELL_PADDING_X = 2.5
@@ -52,12 +54,18 @@ _PAGE_MARGIN = 36.0
 _CONTENT_CLEARANCE = 5.0
 _HEADING_CLEARANCE = 13.0
 _MIN_COLUMN_WIDTH = 34.0
-_HEADING_REGION_TYPES = frozenset({"title", "section_heading", "table_caption", "figure_caption"})
+_HEADING_REGION_TYPES = frozenset(
+    {"title", "section_heading", "table_caption", "figure_caption"}
+)
 _TARGET_CJK_RE = re.compile(r"[\u3000-\u30ff\u3400-\u9fff\uac00-\ud7af]")
 _FULL_DATE_RE = re.compile(r"^\s*\d{2,4}[./-]\d{1,2}[./-]\d{1,2}\s*$")
-_FULL_NUMERIC_RE = re.compile(r"^\s*[<>≤≥±]?\s*[\d.,]+(?:\s*(?:%|‰|℃|°C|[A-Za-zμµ]+(?:/[A-Za-zμµ]+)?))?\s*$")
-_FULL_CODE_RE = re.compile(r"^\s*(?=.*(?:\d|[-/.()]))[A-Za-z][A-Za-z0-9_.()/-]*\s*$")
-_FULL_FORMULA_RE = re.compile(r"^\s*(?=[A-Za-z0-9]*[a-z0-9])(?:[A-Z][a-z]?\d*){2,}\s*$")
+_FULL_NUMERIC_RE = re.compile(
+    r"^\s*[<>≤≥±]?\s*[\d.,]+(?:\s*(?:%|‰|℃|°C|[A-Za-zμµ]+(?:/[A-Za-zμµ]+)?))?\s*$"
+)
+_FULL_CODE_RE = re.compile(
+    r"^\s*(?=.*(?:\d|[-/.()]))[A-Za-z][A-Za-z0-9_.()/-]*\s*$"
+)
+_FULL_FORMULA_RE = re.compile(r"^\s*(?:[A-Z][a-z]?\d*){2,}\s*$")
 _LOCKED_ABBREVIATIONS = frozenset(
     {
         "API",
@@ -75,7 +83,6 @@ _LOCKED_ABBREVIATIONS = frozenset(
         "RRT",
         "RT",
         "SOP",
-        "TOC",
         "USP",
     }
 )
@@ -86,9 +93,10 @@ _LOCKED_ABBREVIATIONS = frozenset(
 _PROTECTED_VALUE_RE = re.compile(
     r"\d{2,4}[./-]\d{1,2}[./-]\d{1,2}"
     r"|[<>≤≥±]?\d+(?:\.\d+)?\s*(?:%|‰|℃|°C|mol/L|mmol/L|μmol/L|mg/mL|μg/mL|µg/mL|ug/mL|ng/mL|mg/L|μg/L|µg/L|ug/L|ng/L|ppm|ppb|mg|kg|μg|µg|ug|ng|mL|μL|µL|uL|L|g|h|min|s)(?:\s*/\s*(?:kg|mL|L|μL|µL|uL|h|min|s))?"
-    r"|(?<![A-Za-z0-9])(?:[A-Z][A-Z0-9_.()/-]*\d[A-Za-z0-9_.()/-]*|[A-Z]{2,}(?:[-/][A-Z0-9.()]+)+)(?![A-Za-z0-9])"
-    r"|(?<![A-Za-z])(?:API|CAPA|GMP|HPLC|ICH|N/A|ND|OOT|OOS|QA|QC|RRT|RT|SOP|TOC|USP)(?:\([A-Za-z0-9-]+\))?(?![A-Za-z])"
-    r"|(?<![A-Za-z])(?=[A-Za-z0-9]*[a-z0-9])(?:[A-Z][a-z]?\d*){2,}(?![A-Za-z])"
+    r"|(?<![A-Za-z0-9])[A-Z]\d{4,}[A-Za-z0-9_.()/-]*(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Z0-9]*\d[A-Za-z0-9_.()/-]*|[A-Z]{2,}(?:[-/][A-Z0-9.()]+)+)(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z])(?:API|CAPA|GMP|HPLC|ICH|N/A|ND|OOT|OOS|QA|QC|RRT|RT|SOP|USP)(?:\([A-Za-z0-9-]+\))?(?![A-Za-z])"
+    r"|(?<![A-Za-z])(?:[A-Z][a-z]?\d*){2,}(?![A-Za-z])"
     r"|(?<=[\u3400-\u9fff])[A-Z](?![A-Za-z])"
     r"|[<>≤≥±]?\d+(?:\.\d+)?"
 )
@@ -128,6 +136,10 @@ class OcrTable:
     column_count: int
     cells: tuple[OcrTableCell, ...]
     preserve_as_image: bool = False
+    # PP-Structure occasionally emits a table region with no HTML/Markdown
+    # grid at all.  The typography pass restores its source pixels, while the
+    # table redraw pass must leave it alone instead of inventing a grid.
+    unreconstructable: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,7 +153,15 @@ class OcrTableTranslationPlan:
 
     @property
     def image_preserved_tables(self) -> int:
-        return sum(table.preserve_as_image for table in self.tables)
+        return sum(
+            table.preserve_as_image and not table.unreconstructable
+            for table in self.tables
+        )
+
+    @property
+    def unreconstructable_preserved_tables(self) -> int:
+        """Tables retained as source pixels because OCR supplied no cell grid."""
+        return sum(table.unreconstructable for table in self.tables)
 
 
 @dataclass(frozen=True)
@@ -157,18 +177,7 @@ class OcrTableRedrawResult:
     continuation_pages: int
     source_page_indices: tuple[int, ...]
     continuation_page_indices: tuple[int, ...]
-    continuation_page_groups: tuple[tuple[int, ...], ...]
-    translated_overlay_regions: tuple[OcrTableOverlayRegion, ...]
     repeated_header_texts: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class OcrTableOverlayRegion:
-    """A visual-coordinate area intentionally changed by table rendering."""
-
-    page_idx: int
-    bbox: tuple[float, float, float, float]
-    continuation: bool
 
 
 @dataclass(frozen=True)
@@ -211,8 +220,6 @@ class _DrawStats:
     inserted_pages: int = 0
     source_page_indices: tuple[int, ...] = ()
     continuation_page_indices: tuple[int, ...] = ()
-    continuation_page_groups: tuple[tuple[int, ...], ...] = ()
-    overlay_regions: tuple[OcrTableOverlayRegion, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -245,7 +252,11 @@ class _PageMap:
 
     @property
     def inserted_target_pages(self) -> tuple[int, ...]:
-        return tuple(page_idx for page_indexes in self.continuation_target_pages for page_idx in page_indexes)
+        return tuple(
+            page_idx
+            for page_indexes in self.continuation_target_pages
+            for page_idx in page_indexes
+        )
 
 
 @dataclass(frozen=True)
@@ -274,7 +285,9 @@ class _StructuredTableParser(HTMLParser):
         self._cell_attrs: dict[str, str] = {}
         self._cell_header = False
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
         lowered = tag.casefold()
         if lowered == "tr":
             self._row = []
@@ -350,7 +363,11 @@ def _positive_bbox(value: Any) -> tuple[float, float, float, float] | None:
         result = tuple(float(value[index]) for index in range(4))
     except (TypeError, ValueError):
         return None
-    if not all(math.isfinite(item) for item in result) or result[2] <= result[0] or result[3] <= result[1]:
+    if (
+        not all(math.isfinite(item) for item in result)
+        or result[2] <= result[0]
+        or result[3] <= result[1]
+    ):
         return None
     return result
 
@@ -364,7 +381,12 @@ def _markdown_rows(value: str) -> list[list[_RawCell]]:
         values = [part.strip().replace("\\|", "|") for part in line[1:-1].split("|")]
         if values and all(re.fullmatch(r":?-{3,}:?", item) for item in values):
             continue
-        rows.append([_RawCell(item, 1, 1, len(rows) == 0) for item in values])
+        rows.append(
+            [
+                _RawCell(item, 1, 1, len(rows) == 0)
+                for item in values
+            ]
+        )
     return rows
 
 
@@ -382,7 +404,12 @@ def _structured_rows(value: Any) -> list[list[_RawCell]]:
     # PP-Structure can absorb the small gap between a caption and a table as
     # one empty, fully merged first row.  It is not part of the source grid and
     # wastes valuable vertical space in the rebuilt table.
-    while len(rows) > 1 and len(rows[0]) == 1 and not rows[0][0].text and rows[0][0].column_span > 1:
+    while (
+        len(rows) > 1
+        and len(rows[0]) == 1
+        and not rows[0][0].text
+        and rows[0][0].column_span > 1
+    ):
         rows = rows[1:]
     return rows
 
@@ -441,7 +468,10 @@ def _positioned_table_texts(
         )
         center_x = (normalised_bbox[0] + normalised_bbox[2]) * 0.5
         center_y = (normalised_bbox[1] + normalised_bbox[3]) * 0.5
-        if not (bbox[0] - 1.0 <= center_x <= bbox[2] + 1.0 and bbox[1] - 1.0 <= center_y <= bbox[3] + 1.0):
+        if not (
+            bbox[0] - 1.0 <= center_x <= bbox[2] + 1.0
+            and bbox[1] - 1.0 <= center_y <= bbox[3] + 1.0
+        ):
             continue
         key = text, normalised_bbox
         if key in seen:
@@ -482,7 +512,9 @@ def _infer_column_anchors(
         return ()
     samples: list[tuple[float, ...]] = []
     for group in _group_positioned_text_lines(positioned):
-        if len(group) != column_count or not all(_is_locked_value(item.text) for item in group):
+        if len(group) != column_count or not all(
+            _is_locked_value(item.text) for item in group
+        ):
             continue
         samples.append(tuple(sorted(item.center_x for item in group)))
     # Two agreeing rows are enough to reject a coincidental numeric header and
@@ -490,7 +522,10 @@ def _infer_column_anchors(
     # merge topology automatically.
     if len(samples) < 2:
         return ()
-    anchors = tuple(float(median(sample[column] for sample in samples)) for column in range(column_count))
+    anchors = tuple(
+        float(median(sample[column] for sample in samples))
+        for column in range(column_count)
+    )
     gaps = [right - left for left, right in zip(anchors, anchors[1:], strict=False)]
     if not gaps or min(gaps) < max(8.0, table_width / (column_count * 5.0)):
         return ()
@@ -517,7 +552,9 @@ def _visual_locked_rows(
         return []
     result: list[tuple[float, tuple[str, ...]]] = []
     for group in _group_positioned_text_lines(positioned):
-        if len(group) != len(anchors) or not all(_is_locked_value(item.text) for item in group):
+        if len(group) != len(anchors) or not all(
+            _is_locked_value(item.text) for item in group
+        ):
             continue
         by_column: dict[int, _PositionedTableText] = {}
         valid = True
@@ -561,11 +598,15 @@ def _header_cell_column_candidates(
     if not cell_key or not anchors:
         return []
     matches = [
-        item for item in positioned if (block_key := _cell_text_key(item.text)) and block_key in cell_key
+        item
+        for item in positioned
+        if (block_key := _cell_text_key(item.text)) and block_key in cell_key
     ]
     if not matches:
         return []
-    gaps = [right - left for left, right in zip(anchors, anchors[1:], strict=False)]
+    gaps = [
+        right - left for left, right in zip(anchors, anchors[1:], strict=False)
+    ]
     cluster_gap = max(16.0, (min(gaps) if gaps else 32.0) * 0.55)
     clusters: list[list[_PositionedTableText]] = []
     for item in sorted(matches, key=lambda member: member.center_x):
@@ -608,7 +649,11 @@ def _map_header_row(
             anchors=anchors,
         )
         selected = next(
-            ((start, end) for start, end in candidates if start > previous_end),
+            (
+                (start, end)
+                for start, end in candidates
+                if start > previous_end
+            ),
             None,
         )
         if selected is None:
@@ -642,7 +687,9 @@ def _repair_phantom_multilevel_header(
     first_value_y = visual_rows[0][0] if visual_rows else float("inf")
     typical_height = median(item.height for item in positioned) if positioned else 0.0
     header_cutoff = first_value_y - max(2.0, typical_height * 0.25)
-    header_texts = tuple(item for item in positioned if item.center_y < header_cutoff)
+    header_texts = tuple(
+        item for item in positioned if item.center_y < header_cutoff
+    )
     top = _map_header_row(rows[1], positioned=header_texts, anchors=anchors)
     lower = _map_header_row(rows[2], positioned=header_texts, anchors=anchors)
     if top is None or lower is None:
@@ -693,8 +740,13 @@ def _repair_phantom_multilevel_header(
     return [rebuilt_top, rebuilt_lower, *rows[3:]]
 
 
-def _simple_raw_row_values(row: list[_RawCell], column_count: int) -> tuple[str, ...] | None:
-    if len(row) != column_count or any(cell.row_span != 1 or cell.column_span != 1 for cell in row):
+def _simple_raw_row_values(
+    row: list[_RawCell], column_count: int
+) -> tuple[str, ...] | None:
+    if (
+        len(row) != column_count
+        or any(cell.row_span != 1 or cell.column_span != 1 for cell in row)
+    ):
         return None
     return tuple(cell.text for cell in row)
 
@@ -744,13 +796,17 @@ def _repair_positioned_value_rows(
         existing_keys = {
             _cell_text_key(values[0])
             for row in repaired
-            if (values := _simple_raw_row_values(row, column_count)) is not None and values[0]
+            if (values := _simple_raw_row_values(row, column_count)) is not None
+            and values[0]
         }
         for _y, values in visual_rows[last_visual_idx + 1 :]:
             if _cell_text_key(values[0]) in existing_keys:
                 continue
             repaired.append(
-                [_RawCell(text=value, row_span=1, column_span=1, header=False) for value in values]
+                [
+                    _RawCell(text=value, row_span=1, column_span=1, header=False)
+                    for value in values
+                ]
             )
     return repaired
 
@@ -802,8 +858,14 @@ def _infer_multilevel_headers(
         if not row_cells:
             break
         continuation = any(
-            cell.row < row_idx < cell.row + cell.row_span for cell in cells if cell.is_header
-        ) or any(cell.row == row_idx - 1 and cell.column_span > 1 for cell in cells if cell.is_header)
+            cell.row < row_idx < cell.row + cell.row_span
+            for cell in cells
+            if cell.is_header
+        ) or any(
+            cell.row == row_idx - 1 and cell.column_span > 1
+            for cell in cells
+            if cell.is_header
+        )
         if not continuation:
             break
         populated = [cell for cell in row_cells if cell.source_text]
@@ -819,7 +881,10 @@ def _infer_multilevel_headers(
         if populated and len(data_like) / len(populated) >= 0.50:
             break
         header_rows.add(row_idx)
-    return tuple(replace(cell, is_header=True) if cell.row in header_rows else cell for cell in cells)
+    return tuple(
+        replace(cell, is_header=True) if cell.row in header_rows else cell
+        for cell in cells
+    )
 
 
 def _logical_cells(rows: list[list[_RawCell]]) -> tuple[tuple[OcrTableCell, ...], int, int]:
@@ -830,7 +895,9 @@ def _logical_cells(rows: list[list[_RawCell]]) -> tuple[tuple[OcrTableCell, ...]
     column_count = expected_columns
     for row_idx, raw_row in enumerate(rows):
         row = list(raw_row)
-        occupied_here = sum(1 for column in range(expected_columns) if (row_idx, column) in occupied)
+        occupied_here = sum(
+            1 for column in range(expected_columns) if (row_idx, column) in occupied
+        )
         supplied_slots = sum(cell.column_span for cell in row)
         # PP-Structure occasionally represents an omitted blank cell as an
         # empty trailing <td>.  A long procedure then shifts into the short
@@ -893,7 +960,9 @@ def _recover_trailing_blank_row(
     blocks: list[Any],
 ) -> tuple[OcrTableCell, ...]:
     """Fill a blank final HTML row from OCR table-text blocks when available."""
-    trailing_indexes = [index for index, cell in enumerate(cells) if cell.row == row_count - 1]
+    trailing_indexes = [
+        index for index, cell in enumerate(cells) if cell.row == row_count - 1
+    ]
     if (
         not trailing_indexes
         or any(cells[index].source_text for index in trailing_indexes)
@@ -925,12 +994,17 @@ def _recover_trailing_blank_row(
         scale_y = page_size[1] / block_page_size[1]
         center_x = (block_bbox[0] + block_bbox[2]) * 0.5 * scale_x
         center_y = (block_bbox[1] + block_bbox[3]) * 0.5 * scale_y
-        if bbox[0] <= center_x <= bbox[2] and band_top <= center_y <= bbox[3]:
+        if (
+            bbox[0] <= center_x <= bbox[2]
+            and band_top <= center_y <= bbox[3]
+        ):
             candidates.append((center_y, center_x, text))
     if not candidates:
         return cells
 
-    grouped: dict[int, list[tuple[float, float, str]]] = {index: [] for index in trailing_indexes}
+    grouped: dict[int, list[tuple[float, float, str]]] = {
+        index: [] for index in trailing_indexes
+    }
     for candidate in candidates:
         center_x = candidate[1]
         containing = [
@@ -938,21 +1012,24 @@ def _recover_trailing_blank_row(
             for index in trailing_indexes
             if bbox[0] + table_width * cells[index].column / column_count
             <= center_x
-            <= bbox[0] + table_width * (cells[index].column + cells[index].column_span) / column_count
+            <= bbox[0]
+            + table_width
+            * (cells[index].column + cells[index].column_span)
+            / column_count
         ]
-        best_index = (
-            containing[0]
-            if containing
-            else min(
-                trailing_indexes,
-                key=lambda index: abs(
-                    center_x
-                    - (
-                        bbox[0]
-                        + table_width * (cells[index].column + cells[index].column_span / 2) / column_count
+        best_index = containing[0] if containing else min(
+            trailing_indexes,
+            key=lambda index: abs(
+                center_x
+                - (
+                    bbox[0]
+                    + table_width
+                    * (
+                        cells[index].column + cells[index].column_span / 2
                     )
-                ),
-            )
+                    / column_count
+                )
+            ),
         )
         grouped[best_index].append(candidate)
 
@@ -1006,7 +1083,10 @@ def _refine_table_bbox(
             0.0,
             min(bbox[2], normalized[2]) - max(bbox[0], normalized[0]),
         )
-        if horizontal_overlap > 0 and normalized[1] < bbox[1] < normalized[3]:
+        if (
+            horizontal_overlap > 0
+            and normalized[1] < bbox[1] < normalized[3]
+        ):
             obstacle_bottom = max(obstacle_bottom, normalized[3])
     if obstacle_bottom <= bbox[1]:
         return bbox
@@ -1021,7 +1101,7 @@ def extract_ocr_tables(ocr_result: dict[str, Any]) -> tuple[OcrTable, ...]:
     """Read every PP-Structure table into a validated logical cell grid."""
     tables: list[OcrTable] = []
     blocks = list(ocr_result.get("blocks") or [])
-    for raw in ocr_result.get("regions") or []:
+    for region_idx, raw in enumerate(ocr_result.get("regions") or []):
         if not isinstance(raw, dict):
             continue
         if canonical_ocr_type(raw.get("type") or raw.get("sub_type")) != "table":
@@ -1050,7 +1130,34 @@ def extract_ocr_tables(ocr_result: dict[str, Any]) -> tuple[OcrTable, ...]:
         )
         cells, row_count, column_count = _logical_cells(rows)
         if not cells or row_count < 1 or column_count < 1:
-            raise OcrTableError(f"第 {page_idx + 1} 页表格没有可重建的单元格结构，不能安全翻译")
+            # A single empty/partial PP-Structure table region must not fail
+            # the entire document.  It can be a duplicate detector box that
+            # overlaps adjacent, reconstructable fragments (as seen on dense
+            # production tables).  The source table has already been restored
+            # as pixels by the typography pass; marking this entry immutable
+            # lets the valid neighbouring grids redraw normally without us
+            # guessing a column topology.
+            logger.warning(
+                "Preserving unreconstructable OCR table region as source pixels: "
+                "page=%d region=%d bbox=%s",
+                page_idx + 1,
+                region_idx + 1,
+                bbox,
+            )
+            tables.append(
+                OcrTable(
+                    index=len(tables),
+                    page_idx=page_idx,
+                    bbox=bbox,
+                    page_size=page_size,
+                    row_count=0,
+                    column_count=0,
+                    cells=(),
+                    preserve_as_image=True,
+                    unreconstructable=True,
+                )
+            )
+            continue
         cells = _recover_trailing_blank_row(
             cells,
             row_count=row_count,
@@ -1069,7 +1176,9 @@ def extract_ocr_tables(ocr_result: dict[str, Any]) -> tuple[OcrTable, ...]:
                 row_count=row_count,
                 column_count=column_count,
                 cells=cells,
-                preserve_as_image=should_preserve_table_as_image(raw.get("structured_content")),
+                preserve_as_image=should_preserve_table_as_image(
+                    raw.get("structured_content")
+                ),
             )
         )
     return tuple(tables)
@@ -1183,12 +1292,16 @@ def _restore_values(text: str, protected: tuple[tuple[str, str], ...]) -> str:
             raw_value_fallbacks.add(placeholder)
             continue
         if placeholder_count != 1:
-            raise OcrTableError(f"译文未逐字保留数据占位符 {placeholder}")
+            raise OcrTableError(
+                f"译文未逐字保留数据占位符 {placeholder}"
+            )
 
     for placeholder, value in protected:
         if placeholder not in raw_value_fallbacks:
             result = result.replace(placeholder, value)
-    if _PLACEHOLDER_RE.search(result) or re.search(r"(?i)JTBL[\s_-]*\d{3}", result):
+    if _PLACEHOLDER_RE.search(result) or re.search(
+        r"(?i)JTBL[\s_-]*\d{3}", result
+    ):
         raise OcrTableError("译文含有未恢复的数据占位符")
     return result
 
@@ -1199,7 +1312,10 @@ def _translation_is_valid(source: str, target: str, target_language: str) -> boo
     normalized_target = (target_language or "").replace("_", "-").casefold()
     if normalized_target.startswith("en") and _TARGET_CJK_RE.search(target):
         return False
-    return not (source.strip() == target.strip() and _needs_translation(source, target_language))
+    return not (
+        source.strip() == target.strip()
+        and _needs_translation(source, target_language)
+    )
 
 
 async def translate_ocr_tables(
@@ -1223,7 +1339,11 @@ async def translate_ocr_tables(
                 or not _needs_translation(cell.source_text, settings.target_language)
             ):
                 preserved_cells += 1
-                if not table.preserve_as_image and cell.source_text and _is_locked_value(cell.source_text):
+                if (
+                    not table.preserve_as_image
+                    and cell.source_text
+                    and _is_locked_value(cell.source_text)
+                ):
                     locked_value_cells += 1
                 continue
             protected_text, values = _protect_values(cell.source_text)
@@ -1279,12 +1399,18 @@ async def translate_ocr_tables(
                         seg_type="table_cell",
                         source_kind="pdf",
                         has_layout=True,
-                        layout_retry_reason=("table_value_placeholder_integrity" if attempt else None),
+                        layout_retry_reason=(
+                            "table_value_placeholder_integrity"
+                            if attempt
+                            else None
+                        ),
                         required_literals=tuple(value for _, value in values),
                         rejected_translation=rejected_translation,
                     )
                     translated = _restore_values(translated, values)
-                    if not _translation_is_valid(cell.source_text, translated, settings.target_language):
+                    if not _translation_is_valid(
+                        cell.source_text, translated, settings.target_language
+                    ):
                         raise OcrTableError("表格说明文字未完整翻译到目标语言")
                     last_error = None
                     break
@@ -1323,7 +1449,8 @@ async def translate_ocr_tables(
         await client.aclose()
 
     translated_tables = tuple(
-        replace(table, cells=tuple(mutable_cells[index])) for index, table in enumerate(tables)
+        replace(table, cells=tuple(mutable_cells[index]))
+        for index, table in enumerate(tables)
     )
     return OcrTableTranslationPlan(
         tables=translated_tables,
@@ -1331,7 +1458,9 @@ async def translate_ocr_tables(
         cell_count=sum(len(table.cells) for table in translated_tables),
         translated_cells=len(candidates),
         preserved_cells=preserved_cells,
-        protected_values=(locked_value_cells + sum(len(values) for *_, values in candidates)),
+        protected_values=(
+            locked_value_cells + sum(len(values) for *_, values in candidates)
+        ),
     )
 
 
@@ -1377,12 +1506,15 @@ def _safe_vertical_bounds(
             continue
         # Ignore the table region itself and any duplicated layout wrapper.
         intersection = rect & source_rect
-        if (
-            not intersection.is_empty
-            and intersection.get_area() >= min(rect.get_area(), source_rect.get_area()) * 0.50
-        ):
+        if not intersection.is_empty and intersection.get_area() >= min(
+            rect.get_area(), source_rect.get_area()
+        ) * 0.50:
             continue
-        clearance = _HEADING_CLEARANCE if item_type in _HEADING_REGION_TYPES else _CONTENT_CLEARANCE
+        clearance = (
+            _HEADING_CLEARANCE
+            if item_type in _HEADING_REGION_TYPES
+            else _CONTENT_CLEARANCE
+        )
         if rect.y1 <= source_rect.y0 + 0.5:
             previous = max(previous, rect.y1 + clearance)
         elif rect.y0 >= source_rect.y1 - 0.5:
@@ -1393,32 +1525,6 @@ def _safe_vertical_bounds(
 def _font_resource(path: Path, *, bold: bool) -> str:
     stem = re.sub(r"[^A-Za-z0-9]", "", path.stem)[:20]
     return f"ocrtable{'bold' if bold else 'regular'}{stem}"
-
-
-def _builtin_cjk_font(text: str) -> str | None:
-    """Use PyMuPDF CJK fonts so extracted text retains canonical Unicode."""
-    if re.search(r"[\uac00-\ud7af]", text):
-        return "korea-s"
-    if re.search(r"[\u3040-\u30ff]", text):
-        return "japan-s"
-    if re.search(r"[\u3400-\u9fff]", text):
-        return "china-s"
-    return None
-
-
-def _textbox_font_args(text: str, font: Path, *, bold: bool) -> dict[str, str]:
-    builtin = _builtin_cjk_font(text)
-    if builtin is not None:
-        return {"fontname": builtin}
-    return {
-        "fontname": _font_resource(font, bold=bold),
-        "fontfile": str(font),
-    }
-
-
-def _measurement_font(text: str, font: Path) -> fitz.Font:
-    builtin = _builtin_cjk_font(text)
-    return fitz.Font(fontname=builtin) if builtin is not None else fitz.Font(fontfile=str(font))
 
 
 def _resolve_bold_font(regular_font: Path) -> Path:
@@ -1468,7 +1574,8 @@ class _TextMeasurer:
             spare = shape.insert_textbox(
                 fitz.Rect(0, 0, usable_width, middle),
                 text,
-                **_textbox_font_args(text, font, bold=bold),
+                fontname=_font_resource(font, bold=bold),
+                fontfile=str(font),
                 fontsize=_TABLE_FONT_SIZE,
                 lineheight=_TABLE_LINE_HEIGHT,
                 align=fitz.TEXT_ALIGN_CENTER if bold else fitz.TEXT_ALIGN_LEFT,
@@ -1491,7 +1598,8 @@ class _TextMeasurer:
             rendered_spare = rendered_page.insert_textbox(
                 rendered_page.rect,
                 text,
-                **_textbox_font_args(text, font, bold=bold),
+                fontname=_font_resource(font, bold=bold),
+                fontfile=str(font),
                 fontsize=_TABLE_FONT_SIZE,
                 lineheight=_TABLE_LINE_HEIGHT,
                 align=fitz.TEXT_ALIGN_CENTER if bold else fitz.TEXT_ALIGN_LEFT,
@@ -1499,15 +1607,25 @@ class _TextMeasurer:
             traces = rendered_page.get_texttrace()
             if rendered_spare < 0 or not traces:
                 raise OcrTableError("无法可靠测量 9 pt 表格文字的真实边界")
-            rendered_bottom = max(float((trace.get("bbox") or (0, 0, 0, 0))[3]) for trace in traces)
+            rendered_bottom = max(
+                float((trace.get("bbox") or (0, 0, 0, 0))[3])
+                for trace in traces
+            )
         finally:
             rendered.close()
-        result = max(high, rendered_bottom + _GLYPH_BOUNDARY_SAFETY) + 2 * _CELL_PADDING_Y
+        result = (
+            max(high, rendered_bottom + _GLYPH_BOUNDARY_SAFETY)
+            + 2 * _CELL_PADDING_Y
+        )
         self.cache[key] = result
         return result
 
 
 def _intrinsic_column_widths(table: OcrTable, regular_font: Path, bold_font: Path) -> list[float]:
+    fonts = {
+        False: fitz.Font(fontfile=str(regular_font)),
+        True: fitz.Font(fontfile=str(bold_font)),
+    }
     widths = [_MIN_COLUMN_WIDTH] * table.column_count
     flow_lengths = [0] * table.column_count
     translated_load = [0.0] * table.column_count
@@ -1516,10 +1634,7 @@ def _intrinsic_column_widths(table: OcrTable, regular_font: Path, bold_font: Pat
     for cell in table.cells:
         if not cell.target_text:
             continue
-        font = _measurement_font(
-            cell.target_text,
-            bold_font if cell.is_header else regular_font,
-        )
+        font = fonts[cell.is_header]
         tokens = re.split(r"[\s\n]+", cell.target_text)
         longest = max(
             (float(font.text_length(token, fontsize=_TABLE_FONT_SIZE)) for token in tokens if token),
@@ -1538,7 +1653,8 @@ def _intrinsic_column_widths(table: OcrTable, regular_font: Path, bold_font: Pat
             max(
                 _MIN_COLUMN_WIDTH * cell.column_span,
                 longest + 2 * _CELL_PADDING_X + 3.0,
-                math.sqrt(max(1.0, total_text_width) * 72.0) + 2 * _CELL_PADDING_X,
+                math.sqrt(max(1.0, total_text_width) * 72.0)
+                + 2 * _CELL_PADDING_X,
             ),
         )
         per_column = desired / cell.column_span
@@ -1550,13 +1666,18 @@ def _intrinsic_column_widths(table: OcrTable, regular_font: Path, bold_font: Pat
             elif _is_locked_value(cell.target_text):
                 value_cells[column] += 1
             if cell.column_span == 1:
-                flow_lengths[column] = max(flow_lengths[column], len(cell.target_text))
+                flow_lengths[column] = max(
+                    flow_lengths[column], len(cell.target_text)
+                )
     for column, length in enumerate(flow_lengths):
         if length >= 80:
             widths[column] *= min(3.0, 1.0 + length / 80.0)
         elif translated_load[column] >= 80:
             widths[column] *= min(2.5, 1.0 + translated_load[column] / 160.0)
-        if populated_cells[column] >= 3 and value_cells[column] / populated_cells[column] >= 0.60:
+        if (
+            populated_cells[column] >= 3
+            and value_cells[column] / populated_cells[column] >= 0.60
+        ):
             widths[column] *= 0.62
     return widths
 
@@ -1566,15 +1687,16 @@ def _minimum_column_widths(
     regular_font: Path,
     bold_font: Path,
 ) -> list[float]:
+    fonts = {
+        False: fitz.Font(fontfile=str(regular_font)),
+        True: fitz.Font(fontfile=str(bold_font)),
+    }
     minimums = [_MIN_COLUMN_WIDTH] * table.column_count
     spanning: list[tuple[OcrTableCell, float]] = []
     for cell in table.cells:
         if not cell.target_text:
             continue
-        font = _measurement_font(
-            cell.target_text,
-            bold_font if cell.is_header else regular_font,
-        )
+        font = fonts[cell.is_header]
         longest = max(
             (
                 float(font.text_length(token, fontsize=_TABLE_FONT_SIZE))
@@ -1612,7 +1734,8 @@ def _allocate_column_widths(
     demands = [max(1.0, desired - minimum) for desired, minimum in zip(intrinsic, minimums, strict=True)]
     demand_total = sum(demands)
     widths = [
-        minimum + remaining * demand / demand_total for minimum, demand in zip(minimums, demands, strict=True)
+        minimum + remaining * demand / demand_total
+        for minimum, demand in zip(minimums, demands, strict=True)
     ]
     correction = total_width - sum(widths)
     widths[-1] += correction
@@ -1714,7 +1837,8 @@ def _layout_table(
     safe_height = measured.safe_bottom - measured.safe_top
     if required_height > safe_height + 0.5:
         raise OcrTableError(
-            f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表在 9 pt / 1.25 倍行距下无法放入页面安全区域"
+            f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表在 9 pt / "
+            "1.25 倍行距下无法放入页面安全区域"
         )
     # Preserve the source table height when possible.  A source scan may touch
     # the physical page margin; in that case the natural 9 pt table is safely
@@ -1759,7 +1883,9 @@ def _header_row_count(table: OcrTable) -> int:
             break
         header_end = max(cell.row + cell.row_span for cell in next_row)
     if header_end > table.row_count:
-        raise OcrTableError(f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表的表头跨越表格边界")
+        raise OcrTableError(
+            f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表的表头跨越表格边界"
+        )
     return max(1, header_end)
 
 
@@ -1776,7 +1902,9 @@ def _validate_fragment_coverage(
         for row in range(fragment.data_start, fragment.data_end):
             coverage[row] += 1
     if any(coverage[row] != 1 for row in range(header_rows, table.row_count)):
-        raise OcrTableError(f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表分页后存在漏行或重复行")
+        raise OcrTableError(
+            f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表分页后存在漏行或重复行"
+        )
 
 
 def _atomic_data_row_groups(
@@ -1818,7 +1946,8 @@ def _split_table_fragments(
     tolerance = 0.5
     if header_height > continuation_capacity + tolerance:
         raise OcrTableError(
-            f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表的表头在 9 pt / 1.25 倍行距下无法放入续页"
+            f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表的表头在 9 pt / "
+            "1.25 倍行距下无法放入续页"
         )
     groups = _atomic_data_row_groups(table, header_rows)
     for start, end in groups:
@@ -1832,8 +1961,12 @@ def _split_table_fragments(
     group_idx = 0
     if not groups:
         if header_height <= first_capacity + tolerance:
-            return header_rows, (_TableFragmentSpec(header_rows, header_rows, True),)
-        return header_rows, (_TableFragmentSpec(header_rows, header_rows, False),)
+            return header_rows, (
+                _TableFragmentSpec(header_rows, header_rows, True),
+            )
+        return header_rows, (
+            _TableFragmentSpec(header_rows, header_rows, False),
+        )
 
     first_start = groups[0][0]
     first_end = first_start
@@ -1862,7 +1995,9 @@ def _split_table_fragments(
             used += group_height
             group_idx += 1
         if end <= start:
-            raise OcrTableError(f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表无法按完整行分页")
+            raise OcrTableError(
+                f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表无法按完整行分页"
+            )
         fragments.append(_TableFragmentSpec(start, end, False))
     return header_rows, tuple(fragments)
 
@@ -1882,6 +2017,7 @@ def _build_pagination_plan(
     ocr_result: dict[str, Any],
     regular_font: Path,
     bold_font: Path,
+    source_page_indices: tuple[int, ...],
 ) -> _PaginationPlan:
     document = fitz.open(str(pdf_path))
     measurer = _TextMeasurer()
@@ -1892,9 +2028,12 @@ def _build_pagination_plan(
         for table in plan.tables:
             if table.preserve_as_image:
                 continue
-            if not 0 <= table.page_idx < document.page_count:
-                raise OcrTableError(f"表格引用了不存在的第 {table.page_idx + 1} 页")
-            segment = fitz.Rect(document[table.page_idx].rect)
+            if not 0 <= table.page_idx < len(source_page_indices):
+                raise OcrTableError(
+                    f"表格引用了不存在的第 {table.page_idx + 1} 页"
+                )
+            source_page_idx = source_page_indices[table.page_idx]
+            segment = fitz.Rect(document[source_page_idx].rect)
             measured = _measure_table(
                 table,
                 segment=segment,
@@ -1907,13 +2046,17 @@ def _build_pagination_plan(
             required_height = sum(measured.row_heights)
             if required_height <= first_capacity + 0.5:
                 header_rows = _header_row_count(table)
-                fragments = (_TableFragmentSpec(header_rows, table.row_count, True),)
+                fragments = (
+                    _TableFragmentSpec(header_rows, table.row_count, True),
+                )
                 _validate_fragment_coverage(
                     table,
                     header_rows=header_rows,
                     fragments=fragments,
                 )
-                table_plans.append(_TablePagination(table, header_rows, fragments, False))
+                table_plans.append(
+                    _TablePagination(table, header_rows, fragments, False)
+                )
                 continue
 
             continuation_capacity = max(1.0, segment.height - 2 * _PAGE_MARGIN)
@@ -1930,8 +2073,8 @@ def _build_pagination_plan(
                 if fragment.on_source_page:
                     assigned.append(fragment)
                     continue
-                slot = continuation_counts[table.page_idx]
-                continuation_counts[table.page_idx] += 1
+                slot = continuation_counts[source_page_idx]
+                continuation_counts[source_page_idx] += 1
                 continuation_fragment_count += 1
                 assigned.append(replace(fragment, continuation_slot=slot))
             repeated_copies = continuation_fragment_count
@@ -1943,7 +2086,9 @@ def _build_pagination_plan(
                 header_rows=header_rows,
                 fragments=tuple(assigned),
             )
-            table_plans.append(_TablePagination(table, header_rows, tuple(assigned), True))
+            table_plans.append(
+                _TablePagination(table, header_rows, tuple(assigned), True)
+            )
     finally:
         measurer.close()
         document.close()
@@ -1979,7 +2124,9 @@ def _fragment_table(
         or cell.row + cell.row_span > fragment.row_count
         for cell in fragment.cells
     ):
-        raise OcrTableError(f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表分页后列映射无效")
+        raise OcrTableError(
+            f"第 {table.page_idx + 1} 页第 {table.index + 1} 张表分页后列映射无效"
+        )
     return fragment
 
 
@@ -2023,7 +2170,9 @@ def _cell_rect(
     cell: OcrTableCell,
 ) -> fitz.Rect:
     x0 = layout.table_rect.x0 + sum(layout.column_widths[: cell.column])
-    x1 = x0 + sum(layout.column_widths[cell.column : cell.column + cell.column_span])
+    x1 = x0 + sum(
+        layout.column_widths[cell.column : cell.column + cell.column_span]
+    )
     y0 = layout.table_rect.y0 + sum(layout.row_heights[: cell.row])
     y1 = y0 + sum(layout.row_heights[cell.row : cell.row + cell.row_span])
     return fitz.Rect(x0, y0, x1, y1)
@@ -2047,15 +2196,12 @@ def _draw_cell_text(
         if cell.is_header or value_only or len(cell.target_text) <= 18
         else fitz.TEXT_ALIGN_LEFT
     )
-    text_height = (
-        measurer.height(
-            cell.target_text,
-            rect.width,
-            font,
-            bold=cell.is_header,
-        )
-        - 2 * _CELL_PADDING_Y
-    )
+    text_height = measurer.height(
+        cell.target_text,
+        rect.width,
+        font,
+        bold=cell.is_header,
+    ) - 2 * _CELL_PADDING_Y
     inner = fitz.Rect(
         rect.x0 + _CELL_PADDING_X,
         max(rect.y0 + _CELL_PADDING_Y, (rect.y0 + rect.y1 - text_height) / 2),
@@ -2071,7 +2217,8 @@ def _draw_cell_text(
         page,
         inner,
         cell.target_text,
-        **_textbox_font_args(cell.target_text, font, bold=cell.is_header),
+        fontname=_font_resource(font, bold=cell.is_header),
+        fontfile=str(font),
         fontsize=_TABLE_FONT_SIZE,
         lineheight=_TABLE_LINE_HEIGHT,
         align=align,
@@ -2079,12 +2226,18 @@ def _draw_cell_text(
         overlay=True,
     )
     if spare < -0.05:
-        raise OcrTableError(f"表格第 {cell.row + 1} 行第 {cell.column + 1} 列在 9 pt 下溢出")
+        raise OcrTableError(
+            f"表格第 {cell.row + 1} 行第 {cell.column + 1} 列在 9 pt 下溢出"
+        )
     inserted_traces = [
-        trace for trace in page.get_texttrace() if int(trace.get("seqno", -1)) > previous_sequence
+        trace
+        for trace in page.get_texttrace()
+        if int(trace.get("seqno", -1)) > previous_sequence
     ]
     if not inserted_traces:
-        raise OcrTableError(f"表格第 {cell.row + 1} 行第 {cell.column + 1} 列未生成可验证文字")
+        raise OcrTableError(
+            f"表格第 {cell.row + 1} 行第 {cell.column + 1} 列未生成可验证文字"
+        )
     visible_bounds = [
         pdf_rect_to_visual(
             page,
@@ -2101,7 +2254,9 @@ def _draw_cell_text(
         or bound.y1 > rect.y1 + tolerance
         for bound in visible_bounds
     ):
-        raise OcrTableError(f"表格第 {cell.row + 1} 行第 {cell.column + 1} 列文字超过单元格边界")
+        raise OcrTableError(
+            f"表格第 {cell.row + 1} 行第 {cell.column + 1} 列文字超过单元格边界"
+        )
 
 
 def _draw_table(
@@ -2171,6 +2326,31 @@ def _target_segment(
     return fitz.Rect(page.rect)
 
 
+def _validated_page_lineage(
+    document: fitz.Document,
+    *,
+    source_page_indices: tuple[int, ...] | None,
+    continuation_page_indices: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    if source_page_indices is None:
+        if continuation_page_indices:
+            raise OcrTableError("续页映射缺少对应的 OCR 原页谱")
+        return tuple(range(document.page_count)), ()
+    sources = tuple(int(index) for index in source_page_indices)
+    continuations = tuple(int(index) for index in continuation_page_indices)
+    valid = (
+        tuple(sorted(set(sources))) == sources
+        and tuple(sorted(set(continuations))) == continuations
+        and all(0 <= index < document.page_count for index in sources)
+        and all(0 <= index < document.page_count for index in continuations)
+        and not set(sources).intersection(continuations)
+        and set(sources).union(continuations) == set(range(document.page_count))
+    )
+    if not valid:
+        raise OcrTableError("表格重绘收到的分页源页谱不完整或顺序无效")
+    return sources, continuations
+
+
 def _insert_continuation_pages(
     document: fitz.Document,
     *,
@@ -2181,7 +2361,9 @@ def _insert_continuation_pages(
     mode = bilingual_layout.mode if bilingual_layout is not None else "mono"
     expected_pages = logical_count * 2 if mode == "interleaved" else logical_count
     if document.page_count != expected_pages:
-        raise OcrTableError(f"分页前 PDF 页数 {document.page_count} 与逻辑页数 {logical_count} 不一致")
+        raise OcrTableError(
+            f"分页前 PDF 页数 {document.page_count} 与逻辑页数 {logical_count} 不一致"
+        )
 
     target_offsets: list[int] = []
     for logical_idx in range(logical_count):
@@ -2192,7 +2374,9 @@ def _insert_continuation_pages(
         target_idx = bilingual_layout.target_page_index(logical_idx)
         offset = None if target_idx is None else target_idx - logical_idx * 2
         if offset not in {0, 1}:
-            raise OcrTableError(f"第 {logical_idx + 1} 页没有可靠的双语译文页位置")
+            raise OcrTableError(
+                f"第 {logical_idx + 1} 页没有可靠的双语译文页位置"
+            )
         target_offsets.append(offset)
 
     # Insert from the back so original physical page indexes remain stable
@@ -2236,11 +2420,15 @@ def _insert_continuation_pages(
             pair_start = logical_idx * 2 + preceding * 2
             offset = target_offsets[logical_idx]
             source_pages.append(pair_start + offset)
-            continuation_pages.append(tuple(pair_start + 2 + slot * 2 + offset for slot in range(count)))
+            continuation_pages.append(
+                tuple(pair_start + 2 + slot * 2 + offset for slot in range(count))
+            )
         else:
             source_page = logical_idx + preceding
             source_pages.append(source_page)
-            continuation_pages.append(tuple(source_page + 1 + slot for slot in range(count)))
+            continuation_pages.append(
+                tuple(source_page + 1 + slot for slot in range(count))
+            )
         preceding += count
     return _PageMap(tuple(source_pages), tuple(continuation_pages))
 
@@ -2252,6 +2440,8 @@ def _redraw_document(
     ocr_result: dict[str, Any],
     regular_font: Path,
     bold_font: Path,
+    source_page_indices: tuple[int, ...],
+    existing_continuation_page_indices: tuple[int, ...],
     bilingual_layout: OcrBilingualLayout | None = None,
 ) -> _DrawStats:
     document = fitz.open(str(pdf_path))
@@ -2265,7 +2455,8 @@ def _redraw_document(
         prepared: list[_PreparedFragment] = []
         for table_plan in pagination.tables:
             table = table_plan.table
-            source_page_idx = page_map.source_target_pages[table.page_idx]
+            logical_source_page_idx = source_page_indices[table.page_idx]
+            source_page_idx = page_map.source_target_pages[logical_source_page_idx]
             source_page = document[source_page_idx]
             source_segment = _target_segment(source_page, bilingual_layout)
             measured = _measure_table(
@@ -2283,9 +2474,9 @@ def _redraw_document(
                 else:
                     if fragment_spec.continuation_slot is None:
                         raise OcrTableError("分页表格缺少续页位置")
-                    page_idx = page_map.continuation_target_pages[table.page_idx][
-                        fragment_spec.continuation_slot
-                    ]
+                    page_idx = page_map.continuation_target_pages[
+                        logical_source_page_idx
+                    ][fragment_spec.continuation_slot]
                     segment = _target_segment(document[page_idx], bilingual_layout)
                 fragment = _fragment_table(
                     table,
@@ -2316,16 +2507,19 @@ def _redraw_document(
         # Remove each complete original table once.  Continuation pages are
         # blank and therefore require no redaction.
         pages_with_redactions: set[int] = set()
-        overlay_regions: list[OcrTableOverlayRegion] = []
         for table_plan in pagination.tables:
             table = table_plan.table
-            page_idx = page_map.source_target_pages[table.page_idx]
+            logical_source_page_idx = source_page_indices[table.page_idx]
+            page_idx = page_map.source_target_pages[logical_source_page_idx]
             page = document[page_idx]
             segment = _target_segment(page, bilingual_layout)
             source_rect = _mapped_rect(segment, table.bbox, table.page_size)
             redaction_rect = fitz.Rect(source_rect)
             for fragment in prepared:
-                if fragment.page_idx == page_idx and fragment.table.index == table.index:
+                if (
+                    fragment.page_idx == page_idx
+                    and fragment.table.index == table.index
+                ):
                     redaction_rect.include_rect(fragment.layout.table_rect)
             add_visual_redaction(
                 page,
@@ -2334,13 +2528,6 @@ def _redraw_document(
                 cross_out=False,
             )
             pages_with_redactions.add(page_idx)
-            overlay_regions.append(
-                OcrTableOverlayRegion(
-                    page_idx=page_idx,
-                    bbox=tuple(float(value) for value in redaction_rect),
-                    continuation=False,
-                )
-            )
         for page_idx in pages_with_redactions:
             document[page_idx].apply_redactions(
                 images=fitz.PDF_REDACT_IMAGE_NONE,
@@ -2357,24 +2544,27 @@ def _redraw_document(
                 bold_font=bold_font,
                 measurer=measurer,
             )
-            if fragment.page_idx in page_map.inserted_target_pages:
-                overlay_regions.append(
-                    OcrTableOverlayRegion(
-                        page_idx=fragment.page_idx,
-                        bbox=tuple(float(value) for value in fragment.layout.table_rect),
-                        continuation=True,
-                    )
-                )
         if pagination.tables:
             _save_replacement(document, pdf_path)
         return _DrawStats(
             tables=len(pagination.tables),
             cells=sum(len(item.table.cells) for item in pagination.tables),
             inserted_pages=sum(pagination.continuation_counts),
-            source_page_indices=page_map.source_target_pages,
-            continuation_page_indices=page_map.inserted_target_pages,
-            continuation_page_groups=page_map.continuation_target_pages,
-            overlay_regions=tuple(overlay_regions),
+            source_page_indices=tuple(
+                page_map.source_target_pages[index]
+                for index in source_page_indices
+            ),
+            continuation_page_indices=tuple(
+                sorted(
+                    (
+                        *(
+                            page_map.source_target_pages[index]
+                            for index in existing_continuation_page_indices
+                        ),
+                        *page_map.inserted_target_pages,
+                    )
+                )
+            ),
         )
     finally:
         measurer.close()
@@ -2389,6 +2579,8 @@ def redraw_ocr_tables(
     bilingual_pdf: str | Path | None = None,
     body_font_path: str | Path,
     bold_font_path: str | Path | None = None,
+    source_page_indices: tuple[int, ...] | None = None,
+    continuation_page_indices: tuple[int, ...] = (),
 ) -> OcrTableRedrawResult:
     """Replace complete source tables with fitted 9 pt vector tables."""
     translated_path = Path(translated_pdf)
@@ -2402,9 +2594,13 @@ def redraw_ocr_tables(
     ):
         if not path.is_file():
             raise FileNotFoundError(f"{label} does not exist: {path}")
+    with fitz.open(str(translated_path)) as document:
+        source_pages, existing_continuations = _validated_page_lineage(
+            document,
+            source_page_indices=source_page_indices,
+            continuation_page_indices=continuation_page_indices,
+        )
     if not plan.tables:
-        with fitz.open(str(translated_path)) as document:
-            source_pages = tuple(range(document.page_count))
         return OcrTableRedrawResult(
             translated_path,
             bilingual_path,
@@ -2416,9 +2612,7 @@ def redraw_ocr_tables(
             0,
             0,
             source_pages,
-            (),
-            (),
-            (),
+            existing_continuations,
             (),
         )
 
@@ -2434,6 +2628,7 @@ def redraw_ocr_tables(
         ocr_result=ocr_result,
         regular_font=regular_font,
         bold_font=bold_font,
+        source_page_indices=source_pages,
     )
     mono = _redraw_document(
         translated_path,
@@ -2441,6 +2636,8 @@ def redraw_ocr_tables(
         ocr_result=ocr_result,
         regular_font=regular_font,
         bold_font=bold_font,
+        source_page_indices=source_pages,
+        existing_continuation_page_indices=existing_continuations,
     )
     bilingual = _DrawStats(0, 0)
     if bilingual_path is not None and bilingual_path.is_file() and bilingual_layout:
@@ -2450,6 +2647,8 @@ def redraw_ocr_tables(
             ocr_result=ocr_result,
             regular_font=regular_font,
             bold_font=bold_font,
+            source_page_indices=source_pages,
+            existing_continuation_page_indices=existing_continuations,
             bilingual_layout=bilingual_layout,
         )
 
@@ -2465,8 +2664,6 @@ def redraw_ocr_tables(
         continuation_pages=mono.inserted_pages,
         source_page_indices=mono.source_page_indices,
         continuation_page_indices=mono.continuation_page_indices,
-        continuation_page_groups=mono.continuation_page_groups,
-        translated_overlay_regions=mono.overlay_regions,
         repeated_header_texts=pagination.repeated_header_texts,
     )
 
@@ -2475,7 +2672,6 @@ __all__ = [
     "OcrTable",
     "OcrTableCell",
     "OcrTableError",
-    "OcrTableOverlayRegion",
     "OcrTableRedrawResult",
     "OcrTableTranslationPlan",
     "extract_ocr_tables",

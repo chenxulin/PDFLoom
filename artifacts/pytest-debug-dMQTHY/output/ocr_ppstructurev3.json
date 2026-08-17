@@ -1,0 +1,199 @@
+{
+  "provider": "paddleocr-ppstructurev3",
+  "markdown": "# QUALITY CONTROL REPORT\n\nThe following results were recorded for batch A-001.\n\n| Item | Result |\n| --- | --- |\n| Appearance | White powder |\n| Assay | 99.5 % |",
+  "pages": [
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "angle": 0
+    }
+  ],
+  "blocks": [
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        100.0,
+        90.0,
+        720.0,
+        150.0
+      ],
+      "text": "QUALITY CONTROL REPORT",
+      "type": "title",
+      "confidence": 0.99
+    },
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        100.0,
+        164.0,
+        1000.0,
+        216.0
+      ],
+      "text": "The following results were recorded for batch A-001.",
+      "type": "text",
+      "confidence": 0.99
+    },
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        100.0,
+        700.0,
+        520.0,
+        756.0
+      ],
+      "text": "Reviewed for release.",
+      "type": "text",
+      "confidence": 0.99
+    },
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        108.0,
+        290.0,
+        600.0,
+        390.0
+      ],
+      "text": "Item",
+      "type": "table_text",
+      "confidence": 0.99
+    },
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        600.0,
+        290.0,
+        1082.0,
+        390.0
+      ],
+      "text": "Result",
+      "type": "table_text",
+      "confidence": 0.99
+    },
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        108.0,
+        390.0,
+        600.0,
+        520.0
+      ],
+      "text": "Appearance",
+      "type": "table_text",
+      "confidence": 0.99
+    },
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        600.0,
+        390.0,
+        1082.0,
+        520.0
+      ],
+      "text": "White powder",
+      "type": "table_text",
+      "confidence": 0.99
+    },
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        108.0,
+        520.0,
+        600.0,
+        650.0
+      ],
+      "text": "Assay",
+      "type": "table_text",
+      "confidence": 0.99
+    },
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        600.0,
+        520.0,
+        1082.0,
+        650.0
+      ],
+      "text": "99.5 %",
+      "type": "table_text",
+      "confidence": 0.99
+    }
+  ],
+  "regions": [
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        100.0,
+        84.0,
+        740.0,
+        156.0
+      ],
+      "type": "title",
+      "structured_content": "QUALITY CONTROL REPORT"
+    },
+    {
+      "page_idx": 0,
+      "page_size": [
+        1190.0,
+        1684.0
+      ],
+      "bbox": [
+        108.0,
+        290.0,
+        1082.0,
+        650.0
+      ],
+      "type": "table",
+      "structured_content": "<table>\n      <tr><th>Item</th><th>Result</th></tr>\n      <tr><td>Appearance</td><td>White powder</td></tr>\n      <tr><td>Assay</td><td>99.5 %</td></tr>\n    </table>",
+      "confidence": 0.99
+    }
+  ],
+  "metadata": {
+    "filename": "scanned-table.pdf",
+    "page_count": 1,
+    "block_count": 9,
+    "region_count": 2
+  }
+}

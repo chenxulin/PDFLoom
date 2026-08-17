@@ -9,7 +9,6 @@ directly to those APIs rotates and displaces every new object a second time.
 Keep all layout calculations in visual coordinates and cross this module only
 at the PDF read / write boundary.
 """
-
 from __future__ import annotations
 
 from typing import Any
@@ -92,15 +91,12 @@ def map_ocr_rect_to_visual(
     width, height = page_size
     if width <= 0 or height <= 0:
         return fitz.Rect()
-    return (
-        fitz.Rect(
-            segment.x0 + bbox[0] * segment.width / width,
-            segment.y0 + bbox[1] * segment.height / height,
-            segment.x0 + bbox[2] * segment.width / width,
-            segment.y0 + bbox[3] * segment.height / height,
-        )
-        & segment
-    )
+    return fitz.Rect(
+        segment.x0 + bbox[0] * segment.width / width,
+        segment.y0 + bbox[1] * segment.height / height,
+        segment.x0 + bbox[2] * segment.width / width,
+        segment.y0 + bbox[3] * segment.height / height,
+    ) & segment
 
 
 def add_visual_redaction(

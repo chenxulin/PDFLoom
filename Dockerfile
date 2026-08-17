@@ -21,7 +21,8 @@ COPY src/ /app/src/
 RUN pip install --upgrade pip wheel setuptools && pip install --prefer-binary .
 
 RUN mkdir -p /data/ocr-pdf-agent
-ENV STORAGE_DIR=/data/ocr-pdf-agent
+ENV STORAGE_DIR=/data/ocr-pdf-agent \
+    NOTO_FONT_PATH=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
 EXPOSE 8010
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \

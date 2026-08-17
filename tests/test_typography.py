@@ -15,7 +15,7 @@ from ocr_pdf_agent.ocr_document_typography import (
 
 
 class TypographyTests(unittest.TestCase):
-    def test_one_engine_block_can_cover_two_adjacent_ocr_paragraphs(self) -> None:
+    def test_merged_engine_block_is_redacted_once_and_other_region_uses_plan(self) -> None:
         document = fitz.open()
         page = document.new_page(width=600, height=800)
         page_size = (600.0, 800.0)
@@ -66,7 +66,11 @@ class TypographyTests(unittest.TestCase):
             {"First translated paragraph.", "Second translated paragraph."},
             {plan.text for plan in plans},
         )
-        self.assertTrue(all(plan.target_rects == (merged.rect,) for plan in plans))
+        # Current Joincare behavior assigns a merged engine block to only one
+        # OCR paragraph. The other paragraph is drawn from the trusted serial
+        # translation plan, avoiding duplicate redaction/drawing of one block.
+        self.assertEqual(1, sum(bool(plan.target_rects) for plan in plans))
+        self.assertEqual(1, sum(not plan.target_rects for plan in plans))
         document.close()
 
 

@@ -1,17 +1,10 @@
 """Detect target-language page regions in PDFMathTranslate bilingual PDFs."""
-
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 
 import fitz
-
-
-def _compact(value: str) -> str:
-    return re.sub(r"\s+", "", value).casefold()
 
 
 @dataclass(frozen=True)
@@ -22,7 +15,11 @@ class OcrBilingualLayout:
 
     def logical_page_index(self, physical_page_idx: int) -> int | None:
         if self.mode == "side_by_side":
-            return physical_page_idx if 0 <= physical_page_idx < self.logical_page_count else None
+            return (
+                physical_page_idx
+                if 0 <= physical_page_idx < self.logical_page_count
+                else None
+            )
         if self.mode == "interleaved":
             logical = physical_page_idx // 2
             return logical if 0 <= logical < self.logical_page_count else None
@@ -74,7 +71,9 @@ def detect_ocr_bilingual_layout(
         mono_count = mono_document.page_count
         if mono_count < 1:
             return None
-        mono_sizes = [(page.rect.width, page.rect.height) for page in mono_document]
+        mono_sizes = [
+            (page.rect.width, page.rect.height) for page in mono_document
+        ]
         if bilingual_document.page_count == mono_count:
             if all(
                 abs(bilingual_document[index].rect.height - mono_height) <= 2
@@ -99,23 +98,12 @@ def detect_ocr_bilingual_layout(
                 for index in pair
             ):
                 return None
-            mono_text = _compact(mono_document[logical_idx].get_text("text"))
-            scores = [
-                SequenceMatcher(
-                    None,
-                    mono_text,
-                    _compact(bilingual_document[index].get_text("text")),
-                    autojunk=False,
-                ).ratio()
-                for index in pair
-            ]
-            # PDFMathTranslate emits source then target for interleaved pairs.
-            # When both pages are table-dominant their extracted text can be
-            # almost identical before the dedicated table redraw, so a tiny
-            # similarity difference must not redirect edits onto the source.
-            targets.append(
-                pair[1] if scores[1] >= scores[0] or abs(scores[1] - scores[0]) <= 0.05 else pair[0]
-            )
+            # PDFMathTranslate's interleaved artifact has a stable source-then-
+            # target contract. Similarity is not a safe discriminator here:
+            # numeric-heavy scanned source pages can resemble the mono target
+            # more closely than the translated page and would then receive
+            # destructive typography edits. Always own the second page.
+            targets.append(pair[1])
         return OcrBilingualLayout(
             mode="interleaved",
             logical_page_count=mono_count,

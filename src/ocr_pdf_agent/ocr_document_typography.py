@@ -8,10 +8,10 @@ numbers without translating them. It first restores tables as clean source
 pixels so the dedicated final pass can replace each complete table with a
 translated vector grid; figures, images, charts and seals remain untouched.
 """
-
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import re
@@ -39,7 +39,12 @@ from .ocr_pdf_coordinates import (
     pdf_rect_to_visual,
     show_pdf_page_visual,
 )
-from .ocr_semantics import canonical_ocr_type, should_inject_source_text
+from .ocr_semantics import (
+    canonical_ocr_type,
+    is_numbered_heading_text,
+    should_inject_source_text,
+    visually_preserved_page_indices,
+)
 from .ocr_table_redraw import (
     _expose_values,
     _needs_translation,
@@ -49,9 +54,15 @@ from .ocr_table_redraw import (
 )
 from .translator import _build_client, translate_chunk
 
+logger = logging.getLogger(__name__)
+
 _BODY_FONT_SIZE = 9.0
 _BODY_LINE_HEIGHT = 1.25
 _VERTICAL_RHYTHM_GAP = _BODY_FONT_SIZE * _BODY_LINE_HEIGHT
+_MIN_VERTICAL_RHYTHM_GAP = _BODY_FONT_SIZE * 0.50
+_CONTINUATION_MARGIN_X_RATIO = 0.075
+_CONTINUATION_MARGIN_TOP = 42.0
+_CONTINUATION_MARGIN_BOTTOM = 48.0
 _PAGE_NUMBER_FONT_SIZE = 8.0
 _PAGE_NUMBER_CONTENT_GAP = 4.0
 _BODY_REGION_TYPE = "text"
@@ -74,6 +85,11 @@ _CJK_GAP_RE = re.compile(
 )
 _ASCII_SHORT_TAIL_RE = re.compile(r"\b([A-Za-z]{2,})\s+([a-z]{1,3})\b")
 _ASCII_SHORT_HEAD_RE = re.compile(r"\b([b-z])\s+([a-z]{3,})\b")
+_SHORT_DOCUMENT_LABEL_RE = re.compile(
+    r"^\s*(?:附件|附录|appendix|annex|attachment)\s*"
+    r"(?:\d+|[IVXLCDM]+|[一二三四五六七八九十]+)\s*[:：]?\s*$",
+    flags=re.IGNORECASE,
+)
 _REPAIRABLE_WORD_SUFFIXES = (
     "able",
     "ally",
@@ -112,6 +128,10 @@ class OcrDocumentTypographyResult:
     rhythm_blocks: int
     bilingual_rhythm_blocks: int
     headings: OcrHeadingTypographyResult
+    continuation_pages: int = 0
+    source_page_indices: tuple[int, ...] = ()
+    continuation_page_indices: tuple[int, ...] = ()
+    continuation_source_pages: tuple[int, ...] = ()
 
 
 class OcrBodyTranslationError(ValueError):
@@ -184,6 +204,10 @@ class _BodyPlan:
     target_rects: tuple[fitz.Rect, ...]
     draw_rect: fitz.Rect
     text: str
+    font_size: float
+    line_height: float
+    anchor_rect: fitz.Rect
+    deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -193,6 +217,9 @@ class _RhythmItem:
     font_path: Path
     font_size: float
     line_height: float
+    align: int = fitz.TEXT_ALIGN_LEFT
+    redaction_rects: tuple[fitz.Rect, ...] = ()
+    deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -202,9 +229,31 @@ class _RhythmPlacement:
 
 
 @dataclass(frozen=True)
+class _RhythmPageLayout:
+    placements: tuple[_RhythmPlacement, ...]
+    overflow: tuple[_RhythmItem, ...]
+
+
+@dataclass(frozen=True)
 class _RhythmRepair:
     blocks: int
     pages: int
+    source_page_indices: tuple[int, ...] = ()
+    continuation_page_indices: tuple[int, ...] = ()
+    continuation_source_pages: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ContinuationLineage:
+    source_page_indices: tuple[int, ...]
+    continuation_page_indices: tuple[int, ...]
+    continuation_source_pages: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _DeferredBodyBlock:
+    page_idx: int
+    item: _RhythmItem
 
 
 @dataclass(frozen=True)
@@ -214,6 +263,7 @@ class _DocumentRepair:
     restored_page_numbers: int
     removed_header_footer_bands: int
     protected_visual_regions: int
+    deferred_body_blocks: tuple[_DeferredBodyBlock, ...] = ()
 
 
 def _positive_pair(value: Any) -> tuple[float, float] | None:
@@ -235,7 +285,11 @@ def _positive_bbox(value: Any) -> tuple[float, float, float, float] | None:
         bbox = tuple(float(value[index]) for index in range(4))
     except (TypeError, ValueError):
         return None
-    if not all(math.isfinite(item) for item in bbox) or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+    if (
+        not all(math.isfinite(item) for item in bbox)
+        or bbox[2] <= bbox[0]
+        or bbox[3] <= bbox[1]
+    ):
         return None
     return bbox
 
@@ -363,22 +417,29 @@ def _deduplicate_body_regions(regions: list[_BodyRegion]) -> list[_BodyRegion]:
                 and outer.bbox[1] <= center_y <= outer.bbox[3]
             ):
                 children.append(inner)
-        covered = sum(_bbox_intersection_area(outer.bbox, child.bbox) for child in children)
+        covered = sum(
+            _bbox_intersection_area(outer.bbox, child.bbox) for child in children
+        )
         if len(children) >= 2 and covered / max(1.0, outer_area) >= 0.60:
             redundant.add(outer_idx)
     return [region for index, region in enumerate(unique) if index not in redundant]
 
 
 def _normalise_body_regions(ocr_result: dict[str, Any]) -> list[_BodyRegion]:
+    preserved_pages = visually_preserved_page_indices(ocr_result)
     sizes = _page_sizes(ocr_result)
     blocks_by_page: dict[
         int,
         list[tuple[tuple[float, float, float, float], tuple[float, float]]],
     ] = {}
+    heading_boxes_by_page: dict[
+        int, list[tuple[float, float, float, float]]
+    ] = {}
+    short_document_labels_by_page: dict[
+        int, list[tuple[float, float, float, float]]
+    ] = {}
     for raw in ocr_result.get("blocks") or []:
         if not isinstance(raw, dict) or not str(raw.get("text") or "").strip():
-            continue
-        if canonical_ocr_type(raw.get("type") or raw.get("sub_type")) != _BODY_REGION_TYPE:
             continue
         try:
             page_idx = int(raw.get("page_idx"))
@@ -386,8 +447,41 @@ def _normalise_body_regions(ocr_result: dict[str, Any]) -> list[_BodyRegion]:
             continue
         bbox = _positive_bbox(raw.get("bbox"))
         page_size = _positive_pair(raw.get("page_size")) or sizes.get(page_idx)
-        if page_idx >= 0 and bbox is not None and page_size is not None:
+        if page_idx < 0 or bbox is None or page_size is None:
+            continue
+        block_type = canonical_ocr_type(raw.get("type") or raw.get("sub_type"))
+        promoted_heading = block_type == "text" and is_numbered_heading_text(
+            raw.get("text")
+        )
+        if block_type in {"title", "section_heading"} or promoted_heading:
+            heading_boxes_by_page.setdefault(page_idx, []).append(bbox)
+            continue
+        if block_type == _BODY_REGION_TYPE:
             blocks_by_page.setdefault(page_idx, []).append((bbox, page_size))
+            normalized_text = unicodedata.normalize(
+                "NFKC", str(raw.get("text") or "")
+            )
+            if _SHORT_DOCUMENT_LABEL_RE.fullmatch(normalized_text):
+                short_document_labels_by_page.setdefault(page_idx, []).append(bbox)
+
+    def follows_heading(
+        page_idx: int,
+        bbox: tuple[float, float, float, float],
+        page_size: tuple[float, float],
+    ) -> bool:
+        width, height = page_size
+        for heading_bbox in heading_boxes_by_page.get(page_idx, []):
+            gap = bbox[1] - heading_bbox[3]
+            if not 0.0 <= gap <= height * 0.04:
+                continue
+            horizontal_gap = max(
+                0.0,
+                max(heading_bbox[0], bbox[0])
+                - min(heading_bbox[2], bbox[2]),
+            )
+            if horizontal_gap <= width * 0.08:
+                return True
+        return False
 
     visuals_by_page: dict[int, list[tuple[float, float, float, float]]] = {}
     tables_by_page: dict[int, list[tuple[float, float, float, float]]] = {}
@@ -442,17 +536,37 @@ def _normalise_body_regions(ocr_result: dict[str, Any]) -> list[_BodyRegion]:
             continue
         combined = _bbox_union([bbox, *members])
         width, height = page_size
+        short_document_label = any(
+            _bbox_overlap_score(combined, label_bbox) > 0
+            for label_bbox in short_document_labels_by_page.get(page_idx, [])
+        )
         table_caption = _is_table_caption_candidate(
             combined,
             tables_by_page.get(page_idx, []),
             page_size,
         )
-        if combined[1] < height * 0.10:
+        # Judge the top margin from PP-Structure's semantic region rather than
+        # the union. Its text-line boxes can extend a little above a valid body
+        # region (or only graze its top edge). Rejecting the expanded union here
+        # drops the paragraph and lets the orphan fallback promote each line as
+        # a separate body region, while the PDF layout engine commonly keeps
+        # those lines in one text block.
+        if bbox[1] < height * 0.10 and not (
+            short_document_label
+            and bbox[1] > header_bottoms.get(page_idx, 0.0) + 2.0
+        ):
             continue
-        if combined[2] - combined[0] < width * 0.22 and len(members) < 2 and not table_caption:
+        if (
+            combined[2] - combined[0] < width * 0.22
+            and len(members) < 2
+            and not table_caption
+            and not follows_heading(page_idx, combined, page_size)
+            and not short_document_label
+        ):
             continue
         if not table_caption and any(
-            _bbox_overlap_score(combined, visual) >= 0.08 for visual in visuals_by_page.get(page_idx, [])
+            _bbox_overlap_score(combined, visual) >= 0.08
+            for visual in visuals_by_page.get(page_idx, [])
         ):
             continue
         regions.append(_BodyRegion(page_idx, combined, page_size))
@@ -466,7 +580,8 @@ def _normalise_body_regions(ocr_result: dict[str, Any]) -> list[_BodyRegion]:
     for page_idx, blocks in blocks_by_page.items():
         for bbox, page_size in blocks:
             if any(
-                region.page_idx == page_idx and _bbox_overlap_score(region.bbox, bbox) > 0
+                region.page_idx == page_idx
+                and _bbox_overlap_score(region.bbox, bbox) > 0
                 for region in regions
             ):
                 continue
@@ -476,19 +591,28 @@ def _normalise_body_regions(ocr_result: dict[str, Any]) -> list[_BodyRegion]:
                 tables_by_page.get(page_idx, []),
                 page_size,
             )
-            if bbox[2] - bbox[0] < width * 0.22 and not table_caption:
+            if (
+                bbox[2] - bbox[0] < width * 0.22
+                and not table_caption
+                and not follows_heading(page_idx, bbox, page_size)
+            ):
                 continue
             if bbox[1] <= header_bottoms.get(page_idx, 0.0) + 2.0:
                 continue
             if bbox[3] >= footer_tops.get(page_idx, math.inf) - 2.0:
                 continue
             if not table_caption and any(
-                _bbox_overlap_score(bbox, visual) >= 0.08 for visual in visuals_by_page.get(page_idx, [])
+                _bbox_overlap_score(bbox, visual) >= 0.08
+                for visual in visuals_by_page.get(page_idx, [])
             ):
                 continue
             regions.append(_BodyRegion(page_idx, bbox, page_size))
     return sorted(
-        _deduplicate_body_regions(regions),
+        (
+            region
+            for region in _deduplicate_body_regions(regions)
+            if region.page_idx not in preserved_pages
+        ),
         key=lambda item: (item.page_idx, item.bbox[1], item.bbox[0]),
     )
 
@@ -504,11 +628,15 @@ def _body_source_texts(
     ocr_result: dict[str, Any],
     regions: list[_BodyRegion],
 ) -> list[str]:
-    blocks: list[tuple[int, tuple[float, float, float, float], str]] = []
+    blocks: list[
+        tuple[int, tuple[float, float, float, float], str]
+    ] = []
     for raw in ocr_result.get("blocks") or []:
         if not isinstance(raw, dict):
             continue
         if canonical_ocr_type(raw.get("type") or raw.get("sub_type")) != _BODY_REGION_TYPE:
+            continue
+        if is_numbered_heading_text(raw.get("text")):
             continue
         text = str(raw.get("text") or "").strip()
         bbox = _positive_bbox(raw.get("bbox"))
@@ -529,7 +657,9 @@ def _body_source_texts(
         parts.sort(key=lambda item: (item[0][1], item[0][0]))
         texts = [text for _, text in parts]
         if not texts:
-            raise OcrBodyTranslationError(f"第 {region.page_idx + 1} 页正文区域没有可翻译的 OCR 原文")
+            raise OcrBodyTranslationError(
+                f"第 {region.page_idx + 1} 页正文区域没有可翻译的 OCR 原文"
+            )
         joined = "".join(texts) if _CJK_RE.search("".join(texts)) else " ".join(texts)
         sources.append(_CJK_GAP_RE.sub("", " ".join(joined.split())).strip())
     return sources
@@ -549,7 +679,9 @@ async def translate_ocr_body_regions(
     sources = _body_source_texts(ocr_result, regions)
     results: list[OcrBodyRegionTranslation | None] = [None] * len(regions)
     candidates = [
-        index for index, source in enumerate(sources) if _needs_translation(source, settings.target_language)
+        index
+        for index, source in enumerate(sources)
+        if _needs_translation(source, settings.target_language)
     ]
     for index, (region, source) in enumerate(zip(regions, sources, strict=True)):
         if index not in candidates:
@@ -602,7 +734,9 @@ async def translate_ocr_body_regions(
                         seg_type="para",
                         source_kind="pdf",
                         has_layout=True,
-                        layout_retry_reason=("ocr_body_placeholder_integrity" if attempt else None),
+                        layout_retry_reason=(
+                            "ocr_body_placeholder_integrity" if attempt else None
+                        ),
                         required_literals=tuple(value for _, value in values),
                         rejected_translation=rejected_translation,
                     )
@@ -612,7 +746,9 @@ async def translate_ocr_body_regions(
                         translated,
                         settings.target_language,
                     ):
-                        raise OcrBodyTranslationError("正文未完整翻译到目标语言")
+                        raise OcrBodyTranslationError(
+                            "正文未完整翻译到目标语言"
+                        )
                     last_error = None
                     break
                 except Exception as exc:  # noqa: BLE001 - strict integrity retries
@@ -679,8 +815,11 @@ def _normalise_page_number(value: str, page_idx: int) -> str | None:
 def _furniture_and_page_numbers(
     ocr_result: dict[str, Any],
 ) -> tuple[list[_FurnitureBand], list[_PageNumber]]:
+    preserved_pages = visually_preserved_page_indices(ocr_result)
     sizes = _page_sizes(ocr_result)
-    regions_by_page: dict[int, list[tuple[tuple[float, float, float, float], str, tuple[float, float]]]] = {}
+    regions_by_page: dict[
+        int, list[tuple[tuple[float, float, float, float], str, tuple[float, float]]]
+    ] = {}
     blocks_by_page: dict[int, list[tuple[tuple[float, float, float, float], str, str]]] = {}
     page_numbers: list[_PageNumber] = []
     for raw in ocr_result.get("regions") or []:
@@ -689,6 +828,8 @@ def _furniture_and_page_numbers(
         try:
             page_idx = int(raw.get("page_idx"))
         except (TypeError, ValueError):
+            continue
+        if page_idx in preserved_pages:
             continue
         bbox = _positive_bbox(raw.get("bbox"))
         page_size = _positive_pair(raw.get("page_size")) or sizes.get(page_idx)
@@ -709,6 +850,8 @@ def _furniture_and_page_numbers(
             page_idx = int(raw.get("page_idx"))
         except (TypeError, ValueError):
             continue
+        if page_idx in preserved_pages:
+            continue
         bbox = _positive_bbox(raw.get("bbox"))
         page_size = _positive_pair(raw.get("page_size")) or sizes.get(page_idx)
         if page_idx < 0 or bbox is None or page_size is None:
@@ -716,14 +859,10 @@ def _furniture_and_page_numbers(
         block_type = canonical_ocr_type(raw.get("type") or raw.get("sub_type"))
         text = str(raw.get("text") or "").strip()
         blocks_by_page.setdefault(page_idx, []).append((bbox, block_type, text))
-        if (
-            block_type in _HEADER_TYPES | _FOOTER_TYPES
-            and (
-                page_idx,
-                block_type,
-            )
-            not in represented_marker_types
-        ):
+        if block_type in _HEADER_TYPES | _FOOTER_TYPES and (
+            page_idx,
+            block_type,
+        ) not in represented_marker_types:
             regions_by_page.setdefault(page_idx, []).append((bbox, block_type, page_size))
         if block_type == "page_number":
             page_number = _normalise_page_number(text, page_idx)
@@ -746,11 +885,21 @@ def _furniture_and_page_numbers(
         blocks = blocks_by_page.get(page_idx, [])
         if headers:
             bottom = max(item[3] for item in headers)
-            explicit_headers = [bbox for bbox, region_type, _ in regions if region_type == "page_header"]
+            explicit_headers = [
+                bbox for bbox, region_type, _ in regions if region_type == "page_header"
+            ]
             if len(explicit_headers) < 2:
-                neighbour_anchor = max(item[3] for item in explicit_headers) if explicit_headers else bottom
-                neighbour_limit = neighbour_anchor + height * _FURNITURE_BAND_NEIGHBOUR_RATIO
-                maximum_bottom = neighbour_anchor + height * _FURNITURE_BAND_MAX_EXTENSION_RATIO
+                neighbour_anchor = (
+                    max(item[3] for item in explicit_headers)
+                    if explicit_headers
+                    else bottom
+                )
+                neighbour_limit = (
+                    neighbour_anchor + height * _FURNITURE_BAND_NEIGHBOUR_RATIO
+                )
+                maximum_bottom = (
+                    neighbour_anchor + height * _FURNITURE_BAND_MAX_EXTENSION_RATIO
+                )
                 bottom = max(
                     [bottom]
                     + [
@@ -777,11 +926,21 @@ def _furniture_and_page_numbers(
             bands.append(_FurnitureBand(page_idx, (0.0, 0.0, width, bottom), page_size))
         if footers:
             top = min(item[1] for item in footers)
-            explicit_footers = [bbox for bbox, region_type, _ in regions if region_type == "page_footer"]
+            explicit_footers = [
+                bbox for bbox, region_type, _ in regions if region_type == "page_footer"
+            ]
             if len(explicit_footers) < 2:
-                neighbour_anchor = min(item[1] for item in explicit_footers) if explicit_footers else top
-                neighbour_limit = neighbour_anchor - height * _FURNITURE_BAND_NEIGHBOUR_RATIO
-                minimum_top = neighbour_anchor - height * _FURNITURE_BAND_MAX_EXTENSION_RATIO
+                neighbour_anchor = (
+                    min(item[1] for item in explicit_footers)
+                    if explicit_footers
+                    else top
+                )
+                neighbour_limit = (
+                    neighbour_anchor - height * _FURNITURE_BAND_NEIGHBOUR_RATIO
+                )
+                minimum_top = (
+                    neighbour_anchor - height * _FURNITURE_BAND_MAX_EXTENSION_RATIO
+                )
                 top = min(
                     [top]
                     + [
@@ -820,7 +979,8 @@ def _repair_broken_ascii_words(value: str) -> str:
 def _clean_pdf_text(value: Any) -> str:
     raw = str(value or "")
     cleaned = "".join(
-        " " if unicodedata.category(character).startswith("C") else character for character in raw
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in raw
     )
     compact = _CJK_GAP_RE.sub("", " ".join(cleaned.split())).strip()
     return _repair_broken_ascii_words(compact)
@@ -954,7 +1114,14 @@ def _regular_font(needs_cjk: bool) -> Path:
     raise FileNotFoundError("No regular font is available for OCR body normalization")
 
 
-def _textbox_spare(text: str, rect: fitz.Rect, font: Path, size: float) -> float:
+def _textbox_spare(
+    text: str,
+    rect: fitz.Rect,
+    font: Path,
+    size: float,
+    line_height: float = _BODY_LINE_HEIGHT,
+    align: int = fitz.TEXT_ALIGN_LEFT,
+) -> float:
     scratch = fitz.open()
     try:
         page = scratch.new_page(width=max(1.0, rect.width), height=max(1.0, rect.height))
@@ -965,8 +1132,8 @@ def _textbox_spare(text: str, rect: fitz.Rect, font: Path, size: float) -> float
                 fontname="bodyfit",
                 fontfile=str(font),
                 fontsize=size,
-                lineheight=_BODY_LINE_HEIGHT,
-                align=fitz.TEXT_ALIGN_LEFT,
+                lineheight=line_height,
+                align=align,
             )
         )
     finally:
@@ -979,7 +1146,9 @@ def _body_plans(
     page_idx: int,
     segment: fitz.Rect,
     body_regions: list[_BodyRegion],
-    body_translations: dict[tuple[int, tuple[float, float, float, float]], str],
+    body_translations: dict[
+        tuple[int, tuple[float, float, float, float]], str
+    ],
     ocr_result: dict[str, Any],
     body_font: Path,
 ) -> list[_BodyPlan]:
@@ -987,16 +1156,22 @@ def _body_plans(
     if not regions:
         return []
     text_items, layout_items = _source_items(ocr_result, page_idx, segment, regions[0].page_size)
-    column_items = [item for item in text_items if item.block_type not in _COLUMN_EXCLUDED_TYPES]
+    column_items = [
+        item for item in text_items if item.block_type not in _COLUMN_EXCLUDED_TYPES
+    ]
     if not column_items:
-        raise RuntimeError(f"Page {page_idx + 1} has body regions but no text column")
+        logger.warning(
+            "Page %d has body regions but no reliable text column; using the "
+            "page-safe margins and deferring paragraphs that do not fit",
+            page_idx + 1,
+        )
     content_left = max(
         segment.x0 + segment.width * 0.025,
-        min(item.rect.x0 for item in column_items),
+        min((item.rect.x0 for item in column_items), default=segment.x0),
     )
     content_right = min(
         segment.x1 - segment.width * 0.025,
-        max(item.rect.x1 for item in column_items),
+        max((item.rect.x1 for item in column_items), default=segment.x1),
     )
     if content_right - content_left < segment.width * 0.25:
         content_left = segment.x0 + segment.width * 0.08
@@ -1025,14 +1200,18 @@ def _body_plans(
                 # Layout engines occasionally emit a stray punctuation glyph
                 # just outside the paragraph's horizontal source box.
                 pairs.append((0.25, region_idx, target_idx))
-            elif not target.horizontal and _vertical_overlap_ratio(source_rect, target.rect) >= 0.45:
+            elif (
+                not target.horizontal
+                and _vertical_overlap_ratio(source_rect, target.rect) >= 0.45
+            ):
                 # Some layout engines ignore PDF /Rotate and place an otherwise
                 # matching line in the correct visual band but at a displaced
                 # x-coordinate. Pair it by band so deterministic OCR redraw can
                 # remove the rotated residue and restore the complete translation.
                 pairs.append(
                     (
-                        0.40 + _vertical_overlap_ratio(source_rect, target.rect),
+                        0.40
+                        + _vertical_overlap_ratio(source_rect, target.rect),
                         region_idx,
                         target_idx,
                     )
@@ -1044,64 +1223,76 @@ def _body_plans(
             continue
         assignments.setdefault(region_idx, []).append(target_idx)
         used_targets.add(target_idx)
-
-    # PDFMathTranslate can merge two adjacent OCR paragraphs into one PDF text
-    # block.  Keep the normal one-to-one assignment first, then let an
-    # otherwise unmatched region share that merged block only when the overlap
-    # is unambiguous.  Both source regions still receive their own translated
-    # text and safe draw box; the shared engine block is merely removed once
-    # typography repair is applied.
-    for region_idx, (_, source_rect) in enumerate(mapped):
-        if region_idx in assignments:
-            continue
-        shared = [
-            (score, target_idx)
-            for score, candidate_region_idx, target_idx in pairs
-            if candidate_region_idx == region_idx
-            and target_idx in used_targets
-            and _rect_overlap_ratio(source_rect, targets[target_idx].rect) >= 0.55
-            and _vertical_overlap_ratio(source_rect, targets[target_idx].rect) >= 0.75
-        ]
-        if shared:
-            assignments[region_idx] = [max(shared)[1]]
-    if len(assignments) != len(mapped):
-        raise RuntimeError(
-            f"Page {page_idx + 1} matched {len(assignments)}/{len(mapped)} "
-            "body regions; refusing to leave mixed typography"
+    unmatched_regions = [
+        region_idx for region_idx in range(len(mapped)) if region_idx not in assignments
+    ]
+    if unmatched_regions:
+        drawable_unmatched = sum(
+            _body_region_key(mapped[index][0].page_idx, mapped[index][0].bbox)
+            in body_translations
+            for index in unmatched_regions
+        )
+        logger.warning(
+            "Page %d matched %d/%d body regions; redrawing %d unmatched "
+            "regions directly from the OCR translation plan",
+            page_idx + 1,
+            len(assignments),
+            len(mapped),
+            drawable_unmatched,
         )
 
     font = fitz.Font(fontfile=str(body_font))
     space_width = max(1.0, float(font.text_length("\u00a0", fontsize=_BODY_FONT_SIZE)))
-    target_use_counts: dict[int, int] = {}
-    for target_indices in assignments.values():
-        for target_idx in target_indices:
-            target_use_counts[target_idx] = target_use_counts.get(target_idx, 0) + 1
     plans: list[_BodyPlan] = []
-    for region_idx, target_indices in sorted(assignments.items()):
-        region, source_rect = mapped[region_idx]
-        target_indices.sort(key=lambda index: (targets[index].rect.y0, targets[index].rect.x0))
+    for region_idx, (region, source_rect) in enumerate(mapped):
+        target_indices = assignments.get(region_idx, [])
+        translated_text = body_translations.get(
+            _body_region_key(region.page_idx, region.bbox)
+        )
+        # A layout engine can omit a translated paragraph entirely even though
+        # the serial OCR translation plan is complete. In that case there is
+        # no PDF text object to redact or use as a geometry anchor; draw the
+        # trusted translation at its OCR source rectangle instead. If this
+        # helper is called without a translation plan, leave the unmatched
+        # engine output untouched because there is no safe target text to draw.
+        if not target_indices and translated_text is None:
+            continue
+        target_indices.sort(
+            key=lambda index: (targets[index].rect.y0, targets[index].rect.x0)
+        )
         assigned_targets = [targets[index] for index in target_indices]
-        shared_engine_block = any(target_use_counts[index] > 1 for index in target_indices)
-        targets_are_horizontal = not shared_engine_block and all(
+        targets_are_horizontal = not assigned_targets or all(
             target.horizontal for target in assigned_targets
         )
-        target_rect = fitz.Rect(assigned_targets[0].rect)
+        target_rect = (
+            fitz.Rect(assigned_targets[0].rect)
+            if assigned_targets
+            else fitz.Rect(source_rect)
+        )
         for target in assigned_targets[1:]:
             target_rect.include_rect(target.rect)
         available_right = content_right
         for item in layout_items:
-            if item.rect.x0 > source_rect.x1 + 2 and _vertical_overlap_ratio(source_rect, item.rect) >= 0.30:
+            if (
+                item.rect.x0 > source_rect.x1 + 2
+                and _vertical_overlap_ratio(source_rect, item.rect) >= 0.30
+            ):
                 available_right = min(available_right, item.rect.x0 - 3)
         draw_left = max(
             content_left,
-            min(source_rect.x0, target_rect.x0) if targets_are_horizontal else source_rect.x0,
+            min(source_rect.x0, target_rect.x0)
+            if targets_are_horizontal
+            else source_rect.x0,
         )
         next_candidates = [
             item.rect.y0
             for item in layout_items
             if (
                 item.rect.y0 > source_rect.y1 + 0.5
-                or (item.block_type == "table" and item.rect.y0 > source_rect.y0 + 0.5)
+                or (
+                    item.block_type == "table"
+                    and item.rect.y0 > source_rect.y0 + 0.5
+                )
             )
             and _horizontal_overlap_ratio(
                 fitz.Rect(draw_left, source_rect.y0, available_right, source_rect.y1),
@@ -1109,12 +1300,14 @@ def _body_plans(
             )
             >= 0.08
         ]
-        next_y = (
-            min(next_candidates)
-            if next_candidates
-            else min(segment.y1, source_rect.y1 + max(36.0, source_rect.height * 1.5))
+        next_y = min(next_candidates) if next_candidates else min(
+            segment.y1, source_rect.y1 + max(36.0, source_rect.height * 1.5)
         )
-        base_top = min(source_rect.y0, target_rect.y0) if targets_are_horizontal else source_rect.y0
+        base_top = (
+            min(source_rect.y0, target_rect.y0)
+            if targets_are_horizontal
+            else source_rect.y0
+        )
         previous_target_bottoms = [
             candidate.rect.y1
             for candidate_idx, candidate in enumerate(targets)
@@ -1126,17 +1319,33 @@ def _body_plans(
             )
             >= 0.08
         ]
-        previous_limit = max(previous_target_bottoms) + 1.5 if previous_target_bottoms else segment.y0
+        # Matched engine text already supplies a reliable anchor and keeps a
+        # small safety gap from the preceding block. Direct OCR fallback boxes
+        # are often only one line high; allow them to use that gap too so a
+        # two-line 9 pt translation can fit. The final rhythm pass restores the
+        # normal document-wide paragraph gap after insertion.
+        previous_gap = 1.5 if assigned_targets else 0.0
+        previous_limit = (
+            max(previous_target_bottoms) + previous_gap
+            if previous_target_bottoms
+            else segment.y0
+        )
+        top_leading = 5.5 if assigned_targets else 6.5
         draw_rect = fitz.Rect(
             draw_left,
-            max(segment.y0, base_top - 5.5, previous_limit),
+            max(segment.y0, base_top - top_leading, previous_limit),
             available_right,
             min(segment.y1, next_y - 0.2),
         )
-        if draw_rect.width < segment.width * 0.18 or draw_rect.height < 8:
-            raise RuntimeError(f"Page {page_idx + 1} body paragraph has no safe layout area")
+        unsafe_layout_area = (
+            draw_rect.width < segment.width * 0.18 or draw_rect.height < 8
+        )
         line_x0s = [x0 for target in assigned_targets for x0 in target.line_x0s]
-        first_x0 = assigned_targets[0].line_x0s[0] if assigned_targets[0].line_x0s else target_rect.x0
+        first_x0 = (
+            assigned_targets[0].line_x0s[0]
+            if assigned_targets and assigned_targets[0].line_x0s
+            else target_rect.x0
+        )
         indent = 0.0
         if targets_are_horizontal:
             indent = (
@@ -1145,7 +1354,6 @@ def _body_plans(
                 else max(0.0, target_rect.x0 - source_rect.x0)
             )
         prefix = "\u00a0" * min(24, int(round(indent / space_width)))
-        translated_text = body_translations.get(_body_region_key(region.page_idx, region.bbox))
         if translated_text is None:
             seen_text: set[str] = set()
             text_parts: list[str] = []
@@ -1155,15 +1363,29 @@ def _body_plans(
                     seen_text.add(target.text)
             translated_text = " ".join(text_parts)
         text = prefix + translated_text
-        if _textbox_spare(text, draw_rect, body_font, _BODY_FONT_SIZE) < 0:
-            raise RuntimeError(
-                f"Page {page_idx + 1} body paragraph cannot fit the unified {_BODY_FONT_SIZE:.1f} pt style"
+        font_size = _BODY_FONT_SIZE
+        line_height = _BODY_LINE_HEIGHT
+        deferred = unsafe_layout_area or (
+            _textbox_spare(text, draw_rect, body_font, font_size, line_height) < 0
+        )
+        if deferred:
+            logger.warning(
+                "Page %d body paragraph cannot use its source-page box at the "
+                "fixed %.1f pt / %.2f line-height style; scheduling it for the "
+                "page layout solver instead of shrinking the font",
+                page_idx + 1,
+                font_size,
+                line_height,
             )
         plans.append(
             _BodyPlan(
                 tuple(fitz.Rect(target.rect) for target in assigned_targets),
                 draw_rect,
                 text,
+                font_size,
+                line_height,
+                fitz.Rect(source_rect),
+                deferred,
             )
         )
     return plans
@@ -1303,8 +1525,6 @@ def _rhythm_items(
         )
         if not body and not heading:
             continue
-        if any(_rect_overlap_ratio(rect, visual) >= 0.05 for visual in visual_rects):
-            continue
         result.append(
             _RhythmItem(
                 rect=rect,
@@ -1315,6 +1535,40 @@ def _rhythm_items(
             )
         )
     return sorted(result, key=lambda item: (item.rect.y0, item.rect.x0))
+
+
+def _immutable_text_rects(
+    page: fitz.Page,
+    *,
+    segment: fitz.Rect,
+    owned_items: list[_RhythmItem],
+    replaceable_rects: list[fitz.Rect],
+) -> list[fitz.Rect]:
+    """Return engine text that the fixed-style compositor does not own.
+
+    These rectangles must remain stationary, but they still participate in
+    collision avoidance.  Treating them as invisible was the direct cause of
+    SourceHan headings and body text being moved over Times-Roman residue.
+    """
+    obstacles: list[fitz.Rect] = []
+    for raw in page.get_text("dict").get("blocks") or []:
+        if raw.get("type") != 0:
+            continue
+        rect = pdf_rect_to_visual(
+            page,
+            fitz.Rect(raw.get("bbox") or (0, 0, 0, 0)),
+        )
+        if rect.is_empty:
+            continue
+        center = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+        if not segment.contains(center):
+            continue
+        if any(_rect_overlap_ratio(rect, item.rect) >= 0.95 for item in owned_items):
+            continue
+        if any(_rect_overlap_ratio(rect, target) >= 0.50 for target in replaceable_rects):
+            continue
+        obstacles.append(rect)
+    return obstacles
 
 
 def _visual_barrier(
@@ -1337,56 +1591,487 @@ def _visual_barrier(
     return min(rect.y0 for rect in candidates), max(rect.y1 for rect in candidates)
 
 
+def _rhythm_item_height(item: _RhythmItem, width: float) -> float:
+    if not item.deferred:
+        return item.rect.height
+    probe_height = max(1000.0, len(item.text) * item.font_size * 2.0)
+    probe = fitz.Rect(0.0, 0.0, max(1.0, width), probe_height)
+    spare = _textbox_spare(
+        item.text,
+        probe,
+        item.font_path,
+        item.font_size,
+        item.line_height,
+        item.align,
+    )
+    if spare < 0:
+        return probe_height
+    return max(item.font_size * item.line_height, probe_height - spare)
+
+
+def _plan_rhythm_placements(
+    items: list[_RhythmItem],
+    *,
+    segment: fitz.Rect,
+    visual_rects: list[fitz.Rect],
+    obstacle_rects: list[fitz.Rect] | None = None,
+    logical_page_number: int | None = None,
+) -> _RhythmPageLayout:
+    if not items:
+        return _RhythmPageLayout((), ())
+    ordered = sorted(items, key=lambda item: (item.rect.y0, item.rect.x0))
+    text_obstacles = list(obstacle_rects or [])
+    overlapping_visuals = [
+        item
+        for item in ordered
+        if any(_rect_overlap_ratio(item.rect, visual) >= 0.05 for visual in visual_rects)
+    ]
+    candidates = [item for item in ordered if item not in overlapping_visuals]
+    if not candidates:
+        return _RhythmPageLayout((), tuple(ordered))
+    barrier_ranges = sorted(
+        (
+            max(segment.y0, rect.y0),
+            min(segment.y1, rect.y1),
+        )
+        for rect in visual_rects
+        if rect.width >= segment.width * 0.20
+        and max(0.0, min(rect.x1, segment.x1) - max(rect.x0, segment.x0))
+        >= min(rect.width, segment.width) * 0.25
+        and rect.y1 > segment.y0
+        and rect.y0 < segment.y1
+    )
+    merged_barriers: list[tuple[float, float]] = []
+    for start, end in barrier_ranges:
+        if not merged_barriers or start > merged_barriers[-1][1] + 1.0:
+            merged_barriers.append((start, end))
+        else:
+            merged_barriers[-1] = (
+                merged_barriers[-1][0],
+                max(merged_barriers[-1][1], end),
+            )
+    bands: list[tuple[float, float, bool]] = []
+    lower = segment.y0
+    for start, end in merged_barriers:
+        if start > lower + 0.5:
+            bands.append((lower, start, lower > segment.y0 + 0.5))
+        lower = max(lower, end)
+    if lower < segment.y1 - 0.5:
+        bands.append((lower, segment.y1, lower > segment.y0 + 0.5))
+    items_by_band: list[list[_RhythmItem]] = [[] for _ in bands]
+    for item in candidates:
+        center = (item.rect.y0 + item.rect.y1) / 2
+        matching = [
+            index
+            for index, (lower, upper, _follows_visual) in enumerate(bands)
+            if lower - 0.5 <= center <= upper + 0.5
+        ]
+        if matching:
+            items_by_band[matching[0]].append(item)
+        elif bands:
+            nearest = min(
+                range(len(bands)),
+                key=lambda index: min(
+                    abs(center - bands[index][0]),
+                    abs(center - bands[index][1]),
+                ),
+            )
+            items_by_band[nearest].append(item)
+    clusters: list[tuple[list[_RhythmItem], float, float, bool]] = []
+    assigned_ids: set[int] = set()
+    for (lower, upper, follows_visual), band_items in zip(
+        bands,
+        items_by_band,
+        strict=True,
+    ):
+        if band_items:
+            clusters.append((band_items, lower, upper, follows_visual))
+            assigned_ids.update(id(item) for item in band_items)
+    overflow_candidates = [
+        item for item in candidates if id(item) not in assigned_ids
+    ]
+
+    placements: list[_RhythmPlacement] = []
+    overflow: list[_RhythmItem] = [*overlapping_visuals, *overflow_candidates]
+    content_right = segment.x1 - segment.width * 0.025
+    for cluster, lower, upper, after_visual in clusters:
+        working = list(cluster)
+        before_visual = upper < segment.y1 - 0.5
+        available_height = max(0.0, upper - lower)
+        page_context = (
+            f"Page {logical_page_number}"
+            if logical_page_number is not None
+            else "Page"
+        )
+        heights = [
+            _rhythm_item_height(
+                item,
+                max(1.0, content_right - max(segment.x0, item.rect.x0)),
+            )
+            for item in working
+        ]
+        while working:
+            gap_count = len(working) - 1 + int(after_visual) + int(before_visual)
+            text_height = sum(heights)
+            minimum_height = text_height + _MIN_VERTICAL_RHYTHM_GAP * gap_count
+            if minimum_height <= available_height + 0.5:
+                break
+            overflow.insert(0, working.pop())
+            heights.pop()
+        if not working:
+            logger.warning(
+                "%s has no room for the next fixed-style text block inside a "
+                "visual-bounded band; moving the trailing content to continuation pages",
+                page_context,
+            )
+            continue
+        gap_count = len(working) - 1 + int(after_visual) + int(before_visual)
+        text_height = sum(heights)
+        preferred_height = text_height + _VERTICAL_RHYTHM_GAP * gap_count
+        gap = _VERTICAL_RHYTHM_GAP
+        if preferred_height > available_height + 0.5 and gap_count:
+            gap = max(
+                _MIN_VERTICAL_RHYTHM_GAP,
+                (available_height - text_height) / gap_count,
+            )
+            logger.warning(
+                "%s fixed %.2f pt paragraph gap needs %.1f pt inside a %.1f pt "
+                "visual-bounded band; compressing the gap to %.2f pt while "
+                "preserving the fixed font size and line height",
+                page_context,
+                _VERTICAL_RHYTHM_GAP,
+                preferred_height,
+                available_height,
+                gap,
+            )
+        total_height = text_height + gap * (len(working) - 1)
+        minimum_start = lower + (gap if after_visual else 0.0)
+        maximum_end = upper - (gap if before_visual else 0.0)
+        start = max(working[0].rect.y0, minimum_start)
+        if start + total_height > maximum_end:
+            start = max(minimum_start, maximum_end - total_height)
+        if start + total_height > maximum_end + 0.5:
+            logger.warning(
+                "%s could not place a fixed-style typography cluster after gap "
+                "fitting; moving it to continuation pages",
+                page_context,
+            )
+            overflow.extend(working)
+            continue
+        cursor = start
+        placed_all = True
+        for item_index, (item, height) in enumerate(
+            zip(working, heights, strict=True)
+        ):
+            while True:
+                occupied = fitz.Rect(
+                    item.rect.x0,
+                    cursor,
+                    max(item.rect.x1, content_right),
+                    cursor + height,
+                )
+                collisions = [
+                    obstacle
+                    for obstacle in text_obstacles
+                    if _vertical_overlap_ratio(occupied, obstacle) >= 0.10
+                    and _horizontal_overlap_ratio(occupied, obstacle) >= 0.08
+                ]
+                if not collisions:
+                    break
+                cursor = max(obstacle.y1 for obstacle in collisions) + gap
+            remaining_height = sum(heights[item_index:]) + gap * (
+                len(working) - item_index - 1
+            )
+            if cursor + remaining_height > maximum_end + 0.5:
+                overflow.extend(working[item_index:])
+                placed_all = False
+                break
+            draw_rect = fitz.Rect(
+                item.rect.x0,
+                cursor,
+                max(item.rect.x1 + 2.0, content_right),
+                cursor + height + item.font_size * 2.0,
+            )
+            placements.append(_RhythmPlacement(item, draw_rect))
+            cursor += height + gap
+        if not placed_all:
+            logger.warning(
+                "%s immutable PDF text leaves no collision-free room for the "
+                "remaining fixed-style blocks; moving the trailing content to "
+                "continuation pages",
+                page_context,
+            )
+
+    if overflow:
+        cutoff = min((item.rect.y0, item.rect.x0) for item in overflow)
+        overflow = [
+            item for item in ordered if (item.rect.y0, item.rect.x0) >= cutoff
+        ]
+        overflow_ids = {id(item) for item in overflow}
+        placements = [
+            placement
+            for placement in placements
+            if id(placement.item) not in overflow_ids
+        ]
+    return _RhythmPageLayout(tuple(placements), tuple(overflow))
+
+
 def _rhythm_placements(
     items: list[_RhythmItem],
     *,
     segment: fitz.Rect,
     visual_rects: list[fitz.Rect],
+    obstacle_rects: list[fitz.Rect] | None = None,
+    logical_page_number: int | None = None,
 ) -> list[_RhythmPlacement]:
-    if len(items) < 2:
-        return []
-    clusters: list[tuple[list[_RhythmItem], float, float, bool]] = []
-    current = [items[0]]
-    lower = segment.y0
-    follows_visual = False
-    for previous, item in zip(items, items[1:], strict=False):
-        barrier = _visual_barrier(previous, item, visual_rects, segment)
-        if barrier is None:
-            current.append(item)
-            continue
-        clusters.append((current, lower, barrier[0], follows_visual))
-        current = [item]
-        lower = barrier[1]
-        follows_visual = True
-    clusters.append((current, lower, segment.y1, follows_visual))
-
-    placements: list[_RhythmPlacement] = []
-    content_right = segment.x1 - segment.width * 0.025
-    for cluster, lower, upper, after_visual in clusters:
-        total_height = sum(item.rect.height for item in cluster) + _VERTICAL_RHYTHM_GAP * (len(cluster) - 1)
-        minimum_start = lower + (_VERTICAL_RHYTHM_GAP if after_visual else 0.0)
-        maximum_end = upper - (_VERTICAL_RHYTHM_GAP if upper < segment.y1 - 0.5 else 0.0)
-        start = max(cluster[0].rect.y0, minimum_start)
-        if start + total_height > maximum_end:
-            start = max(minimum_start, maximum_end - total_height)
-        if start + total_height > maximum_end + 0.5:
-            raise RuntimeError("Fixed 1.25-line paragraph rhythm cannot fit around a visual region")
-        cursor = start
-        for item in cluster:
-            draw_rect = fitz.Rect(
-                item.rect.x0,
-                cursor,
-                max(item.rect.x1 + 2.0, content_right),
-                cursor + item.rect.height + item.font_size * 2.0,
-            )
-            placements.append(_RhythmPlacement(item, draw_rect))
-            cursor += item.rect.height + _VERTICAL_RHYTHM_GAP
-    return placements
+    return list(
+        _plan_rhythm_placements(
+            items,
+            segment=segment,
+            visual_rects=visual_rects,
+            obstacle_rects=obstacle_rects,
+            logical_page_number=logical_page_number,
+        ).placements
+    )
 
 
 def _rhythm_font_resource_name(path: Path, size: float) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9]", "", path.stem)[:18]
     return f"ocrrhythm{cleaned}{int(round(size * 10))}"
+
+
+def _text_prefix_for_rect(
+    item: _RhythmItem,
+    text: str,
+    rect: fitz.Rect,
+) -> tuple[str, str]:
+    if _textbox_spare(
+        text,
+        rect,
+        item.font_path,
+        item.font_size,
+        item.line_height,
+        item.align,
+    ) >= 0:
+        return text, ""
+    units = re.findall(r"\S+\s*", text) if re.search(r"\s", text) else list(text)
+    if not units:
+        return "", text
+
+    def fitting_prefix(parts: list[str]) -> int:
+        low = 1
+        high = len(parts)
+        fitted = 0
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = "".join(parts[:middle]).rstrip()
+            if candidate and _textbox_spare(
+                candidate,
+                rect,
+                item.font_path,
+                item.font_size,
+                item.line_height,
+                item.align,
+            ) >= 0:
+                fitted = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        return fitted
+
+    count = fitting_prefix(units)
+    if count == 0 and len(units) == 1 and len(text) > 1:
+        units = list(text)
+        count = fitting_prefix(units)
+    if count == 0:
+        return "", text
+    prefix = "".join(units[:count]).rstrip()
+    remainder = "".join(units[count:]).lstrip()
+    return prefix, remainder
+
+
+def _continuation_target_page(
+    document: fitz.Document,
+    *,
+    reference_rect: fitz.Rect,
+    mode: str,
+    target_offset: int,
+) -> tuple[fitz.Page, tuple[int, ...]]:
+    if mode == "interleaved":
+        pair_start = document.page_count
+        document.new_page(width=reference_rect.width, height=reference_rect.height)
+        document.new_page(width=reference_rect.width, height=reference_rect.height)
+        if target_offset not in {0, 1}:
+            raise RuntimeError("Interleaved continuation has no reliable target offset")
+        return (
+            document[pair_start + target_offset],
+            (pair_start, pair_start + 1),
+        )
+    page = document.new_page(width=reference_rect.width, height=reference_rect.height)
+    return page, (page.number,)
+
+
+def _continuation_segment(page: fitz.Page, mode: str) -> fitz.Rect:
+    segment = fitz.Rect(page.rect)
+    if mode == "side_by_side":
+        segment.x0 += segment.width / 2
+    return segment
+
+
+def _append_rhythm_continuations(
+    document: fitz.Document,
+    *,
+    overflow_by_page: dict[int, list[_RhythmItem]],
+    reference_rects: dict[int, fitz.Rect],
+    reference_page_indices: dict[int, int],
+    mode: str,
+) -> _ContinuationLineage:
+    original_page_count = document.page_count
+    appended_groups: dict[int, list[tuple[int, ...]]] = {}
+    for source_page_idx in sorted(overflow_by_page):
+        queued = list(overflow_by_page[source_page_idx])
+        if not queued:
+            continue
+        reference = reference_rects[source_page_idx]
+        target_offset = 0
+        if mode == "interleaved":
+            target_offset = (
+                reference_page_indices[source_page_idx] - source_page_idx * 2
+            )
+        page: fitz.Page | None = None
+        content_rect = fitz.Rect()
+        cursor = 0.0
+        page_has_text = False
+
+        def next_page(
+            *,
+            reference_rect: fitz.Rect,
+            source_index: int,
+            continuation_target_offset: int,
+        ) -> None:
+            nonlocal page, content_rect, cursor, page_has_text
+            page, physical_group = _continuation_target_page(
+                document,
+                reference_rect=reference_rect,
+                mode=mode,
+                target_offset=continuation_target_offset,
+            )
+            appended_groups.setdefault(source_index, []).append(physical_group)
+            segment = _continuation_segment(page, mode)
+            content_rect = fitz.Rect(
+                segment.x0 + segment.width * _CONTINUATION_MARGIN_X_RATIO,
+                segment.y0 + _CONTINUATION_MARGIN_TOP,
+                segment.x1 - segment.width * _CONTINUATION_MARGIN_X_RATIO,
+                segment.y1 - _CONTINUATION_MARGIN_BOTTOM,
+            )
+            cursor = content_rect.y0
+            page_has_text = False
+
+        for item in queued:
+            remaining = item.text
+            first_chunk = True
+            while remaining:
+                if page is None:
+                    next_page(
+                        reference_rect=reference,
+                        source_index=source_page_idx,
+                        continuation_target_offset=target_offset,
+                    )
+                assert page is not None
+                gap = _VERTICAL_RHYTHM_GAP if page_has_text and first_chunk else 0.0
+                draw_top = cursor + gap
+                available = fitz.Rect(
+                    content_rect.x0,
+                    draw_top,
+                    content_rect.x1,
+                    content_rect.y1,
+                )
+                if available.height < item.font_size * item.line_height:
+                    next_page(
+                        reference_rect=reference,
+                        source_index=source_page_idx,
+                        continuation_target_offset=target_offset,
+                    )
+                    continue
+                prefix, remainder = _text_prefix_for_rect(item, remaining, available)
+                if remainder and page_has_text:
+                    # Keep complete paragraphs together whenever a fresh page
+                    # can accommodate them. Split only an item that is taller
+                    # than an otherwise empty continuation page.
+                    next_page(
+                        reference_rect=reference,
+                        source_index=source_page_idx,
+                        continuation_target_offset=target_offset,
+                    )
+                    continue
+                if not prefix:
+                    raise RuntimeError(
+                        "A fixed-style paragraph cannot fit on an empty continuation page"
+                    )
+                spare = insert_visual_textbox(
+                    page,
+                    available,
+                    prefix,
+                    fontname=_rhythm_font_resource_name(item.font_path, item.font_size),
+                    fontfile=str(item.font_path),
+                    fontsize=item.font_size,
+                    lineheight=item.line_height,
+                    align=item.align,
+                    color=(0, 0, 0),
+                    overlay=True,
+                )
+                if spare < 0:
+                    raise RuntimeError(
+                        "Continuation paragraph overflowed after fixed-style preflight"
+                    )
+                cursor = available.y1 - spare
+                page_has_text = True
+                remaining = remainder
+                first_chunk = False
+                if remaining:
+                    next_page(
+                        reference_rect=reference,
+                        source_index=source_page_idx,
+                        continuation_target_offset=target_offset,
+                    )
+
+    logical_pages = sorted(reference_page_indices)
+    if logical_pages != list(range(len(logical_pages))):
+        raise RuntimeError("Fixed-style pagination produced a sparse source page map")
+    if mode == "interleaved" and original_page_count != len(logical_pages) * 2:
+        raise RuntimeError("Interleaved pagination source page count changed unexpectedly")
+    if mode != "interleaved" and original_page_count != len(logical_pages):
+        raise RuntimeError("Pagination source page count changed unexpectedly")
+
+    page_order: list[int] = []
+    source_page_indices: list[int] = []
+    continuation_page_indices: list[int] = []
+    continuation_source_pages: list[int] = []
+    for logical_page_idx in logical_pages:
+        if mode == "interleaved":
+            original_group = (logical_page_idx * 2, logical_page_idx * 2 + 1)
+            target_offset = (
+                reference_page_indices[logical_page_idx] - logical_page_idx * 2
+            )
+        else:
+            original_group = (reference_page_indices[logical_page_idx],)
+            target_offset = 0
+        source_page_indices.append(len(page_order) + target_offset)
+        page_order.extend(original_group)
+        for physical_group in appended_groups.get(logical_page_idx, ()):
+            continuation_page_indices.append(len(page_order) + target_offset)
+            continuation_source_pages.append(logical_page_idx)
+            page_order.extend(physical_group)
+
+    if sorted(page_order) != list(range(document.page_count)):
+        raise RuntimeError("Fixed-style pagination page lineage is incomplete")
+    if page_order != list(range(document.page_count)):
+        document.select(page_order)
+    return _ContinuationLineage(
+        tuple(source_page_indices),
+        tuple(continuation_page_indices),
+        tuple(continuation_source_pages),
+    )
 
 
 def _repair_vertical_rhythm(
@@ -1398,13 +2083,19 @@ def _repair_vertical_rhythm(
     page_numbers: list[_PageNumber],
     segment_factory: Callable[[fitz.Page, int], fitz.Rect | None],
     logical_page_factory: Callable[[int], int | None],
+    deferred_body_blocks: tuple[_DeferredBodyBlock, ...] = (),
+    continuation_mode: str = "mono",
 ) -> _RhythmRepair:
     document = fitz.open(str(pdf_path))
     repaired_blocks = 0
     repaired_pages = 0
+    overflow_by_page: dict[int, list[_RhythmItem]] = {}
+    reference_rects: dict[int, fitz.Rect] = {}
+    reference_page_indices: dict[int, int] = {}
     changed = False
     try:
-        for page_idx in range(document.page_count):
+        original_page_count = document.page_count
+        for page_idx in range(original_page_count):
             page = document[page_idx]
             logical_page_idx = logical_page_factory(page_idx)
             if logical_page_idx is None:
@@ -1412,6 +2103,8 @@ def _repair_vertical_rhythm(
             segment = segment_factory(page, page_idx)
             if segment is None:
                 continue
+            reference_rects[logical_page_idx] = fitz.Rect(page.rect)
+            reference_page_indices[logical_page_idx] = page_idx
             visuals = _visual_rects(ocr_result, logical_page_idx, segment)
             items = _rhythm_items(
                 page,
@@ -1420,40 +2113,98 @@ def _repair_vertical_rhythm(
                 heading_font=heading_font,
                 visual_rects=visuals,
             )
-            page_numbers_here = [number for number in page_numbers if number.page_idx == logical_page_idx]
+            deferred_here = [
+                block.item
+                for block in deferred_body_blocks
+                if block.page_idx == logical_page_idx
+            ]
+            deferred_targets = [
+                rect
+                for item in deferred_here
+                for rect in item.redaction_rects
+            ]
+            if deferred_targets:
+                items = [
+                    item
+                    for item in items
+                    if not any(
+                        _rect_overlap_ratio(item.rect, target) >= 0.50
+                        for target in deferred_targets
+                    )
+                ]
+            immutable_text = _immutable_text_rects(
+                page,
+                segment=segment,
+                owned_items=items,
+                replaceable_rects=deferred_targets,
+            )
+            items.extend(deferred_here)
+            items.sort(key=lambda item: (item.rect.y0, item.rect.x0))
+            page_numbers_here = [
+                number
+                for number in page_numbers
+                if number.page_idx == logical_page_idx
+            ]
             rhythm_segment = fitz.Rect(segment)
             if page_numbers_here:
                 rhythm_segment.y1 = min(
                     rhythm_segment.y1,
-                    min(_page_number_rect(number, segment).y0 for number in page_numbers_here)
+                    min(
+                        _page_number_rect(number, segment).y0
+                        for number in page_numbers_here
+                    )
                     - _PAGE_NUMBER_CONTENT_GAP,
                 )
                 if rhythm_segment.y1 <= rhythm_segment.y0:
-                    raise RuntimeError(
-                        f"Page {logical_page_idx + 1} has no safe content area above page number"
+                    logger.warning(
+                        "Page %d page-number geometry leaves no content area; "
+                        "ignoring that clearance instead of failing pagination",
+                        logical_page_idx + 1,
                     )
-            placements = _rhythm_placements(
+                    rhythm_segment = fitz.Rect(segment)
+            layout = _plan_rhythm_placements(
                 items,
                 segment=rhythm_segment,
                 visual_rects=visuals,
+                obstacle_rects=immutable_text,
+                logical_page_number=logical_page_idx + 1,
             )
-            moved_placements = (
-                []
-                if not placements
-                or all(
-                    abs(placement.item.rect.y0 - placement.draw_rect.y0) <= 0.25 for placement in placements
+            placement_list = list(layout.placements)
+            draw_placements = (
+                placement_list
+                if any(
+                    placement.item.deferred
+                    or abs(placement.item.rect.y0 - placement.draw_rect.y0) > 0.25
+                    for placement in placement_list
                 )
-                else placements
+                else []
             )
-            if not moved_placements and not page_numbers_here:
+            overflow_items = list(layout.overflow)
+            if overflow_items:
+                overflow_by_page.setdefault(logical_page_idx, []).extend(
+                    overflow_items
+                )
+            if not draw_placements and not overflow_items and not page_numbers_here:
                 continue
-            for placement in moved_placements:
-                add_visual_redaction(
-                    page,
-                    placement.item.rect,
-                    fill=None,
-                    cross_out=False,
-                )
+            redaction_items = [
+                *(placement.item for placement in draw_placements),
+                *overflow_items,
+            ]
+            seen_redactions: set[tuple[float, float, float, float]] = set()
+            for item in redaction_items:
+                redaction_rects = item.redaction_rects or (item.rect,)
+                for raw_rect in redaction_rects:
+                    rect = fitz.Rect(raw_rect)
+                    key = tuple(round(value, 2) for value in rect)
+                    if rect.is_empty or key in seen_redactions:
+                        continue
+                    seen_redactions.add(key)
+                    add_visual_redaction(
+                        page,
+                        rect,
+                        fill=None,
+                        cross_out=False,
+                    )
             for number in page_numbers_here:
                 add_visual_redaction(
                     page,
@@ -1466,7 +2217,7 @@ def _repair_vertical_rhythm(
                 graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                 text=fitz.PDF_REDACT_TEXT_REMOVE,
             )
-            for placement in moved_placements:
+            for placement in draw_placements:
                 item = placement.item
                 spare = insert_visual_textbox(
                     page,
@@ -1476,7 +2227,7 @@ def _repair_vertical_rhythm(
                     fontfile=str(item.font_path),
                     fontsize=item.font_size,
                     lineheight=item.line_height,
-                    align=fitz.TEXT_ALIGN_LEFT,
+                    align=item.align,
                     color=(0, 0, 0),
                     overlay=True,
                 )
@@ -1484,15 +2235,41 @@ def _repair_vertical_rhythm(
                     raise RuntimeError("Typography block overflowed during vertical rhythm repair")
             for number in page_numbers_here:
                 _draw_page_number(page, number, segment, body_font)
-            if moved_placements:
-                repaired_blocks += len(moved_placements)
+            if draw_placements or overflow_items:
+                repaired_blocks += len(draw_placements) + len(overflow_items)
                 repaired_pages += 1
+            changed = True
+        lineage = (
+            _append_rhythm_continuations(
+                document,
+                overflow_by_page=overflow_by_page,
+                reference_rects=reference_rects,
+                reference_page_indices=reference_page_indices,
+                mode=continuation_mode,
+            )
+            if overflow_by_page
+            else _ContinuationLineage(
+                tuple(
+                    reference_page_indices[index]
+                    for index in sorted(reference_page_indices)
+                ),
+                (),
+                (),
+            )
+        )
+        if lineage.continuation_page_indices:
             changed = True
         if changed:
             _save_replacement(document, pdf_path)
     finally:
         document.close()
-    return _RhythmRepair(repaired_blocks, repaired_pages)
+    return _RhythmRepair(
+        repaired_blocks,
+        repaired_pages,
+        source_page_indices=lineage.source_page_indices,
+        continuation_page_indices=lineage.continuation_page_indices,
+        continuation_source_pages=lineage.continuation_source_pages,
+    )
 
 
 def _save_replacement(document: fitz.Document, destination: Path) -> None:
@@ -1554,7 +2331,9 @@ def _repair_document(
     source_pdf: Path | None,
     ocr_result: dict[str, Any],
     body_regions: list[_BodyRegion],
-    body_translations: dict[tuple[int, tuple[float, float, float, float]], str],
+    body_translations: dict[
+        tuple[int, tuple[float, float, float, float]], str
+    ],
     bands: list[_FurnitureBand],
     page_numbers: list[_PageNumber],
     body_font: Path,
@@ -1563,12 +2342,15 @@ def _repair_document(
     logical_page_factory: Callable[[int], int | None],
 ) -> _DocumentRepair:
     document = fitz.open(str(pdf_path))
-    source_document = fitz.open(str(source_pdf)) if source_pdf is not None and source_pdf.is_file() else None
+    source_document = (
+        fitz.open(str(source_pdf)) if source_pdf is not None and source_pdf.is_file() else None
+    )
     repaired_blocks = 0
     repaired_pages = 0
     restored_numbers = 0
     removed_bands = 0
     protected_visuals = 0
+    deferred_body_blocks: list[_DeferredBodyBlock] = []
     changed = False
     try:
         for page_idx in range(document.page_count):
@@ -1592,8 +2374,12 @@ def _repair_document(
                 if target is not None
                 else []
             )
-            page_bands = [item for item in bands if item.page_idx == logical_page_idx]
-            page_numbers_here = [item for item in page_numbers if item.page_idx == logical_page_idx]
+            page_bands = [
+                item for item in bands if item.page_idx == logical_page_idx
+            ]
+            page_numbers_here = [
+                item for item in page_numbers if item.page_idx == logical_page_idx
+            ]
             pixel_regions = (
                 _preserved_pixel_regions(ocr_result, logical_page_idx)
                 if target is not None
@@ -1602,6 +2388,24 @@ def _repair_document(
                 else []
             )
             for plan in plans:
+                if plan.deferred:
+                    deferred_body_blocks.append(
+                        _DeferredBodyBlock(
+                            logical_page_idx,
+                            _RhythmItem(
+                                rect=fitz.Rect(plan.anchor_rect),
+                                text=plan.text,
+                                font_path=body_font,
+                                font_size=plan.font_size,
+                                line_height=plan.line_height,
+                                redaction_rects=tuple(
+                                    fitz.Rect(rect) for rect in plan.target_rects
+                                ),
+                                deferred=True,
+                            ),
+                        )
+                    )
+                    continue
                 for target_rect in plan.target_rects:
                     rect = fitz.Rect(target_rect)
                     rect.x0 -= 0.7
@@ -1642,20 +2446,23 @@ def _repair_document(
                 )
                 changed = True
             for plan in plans:
+                if plan.deferred:
+                    continue
                 spare = insert_visual_textbox(
                     page,
                     plan.draw_rect,
                     plan.text,
                     fontname=_font_resource_name(body_font),
                     fontfile=str(body_font),
-                    fontsize=_BODY_FONT_SIZE,
-                    lineheight=_BODY_LINE_HEIGHT,
+                    fontsize=plan.font_size,
+                    lineheight=plan.line_height,
                     align=fitz.TEXT_ALIGN_LEFT,
                     color=(0, 0, 0),
                     overlay=True,
                 )
                 if spare < 0:
                     raise RuntimeError("OCR body unexpectedly overflowed after preflight fitting")
+                changed = True
             for segment in segments:
                 for number in page_numbers_here:
                     _draw_page_number(page, number, segment, body_font)
@@ -1696,6 +2503,7 @@ def _repair_document(
         restored_numbers,
         removed_bands,
         protected_visuals,
+        tuple(deferred_body_blocks),
     )
 
 
@@ -1721,7 +2529,9 @@ def restore_ocr_document_typography(
         for item in (body_translation_plan.regions if body_translation_plan else ())
     }
     if body_translation_plan is not None and len(body_translations) != len(body_regions):
-        raise OcrBodyTranslationError("正文翻译计划与 OCR 正文区域数量不一致")
+        raise OcrBodyTranslationError(
+            "正文翻译计划与 OCR 正文区域数量不一致"
+        )
     bands, page_numbers = _furniture_and_page_numbers(ocr_result)
 
     # Repair headings first. Some PDF engines give a shrunken multi-line
@@ -1735,8 +2545,34 @@ def restore_ocr_document_typography(
         heading_translation_plan=heading_translation_plan,
     )
 
+    def deferred_heading_blocks(raw_items: tuple[Any, ...]) -> tuple[_DeferredBodyBlock, ...]:
+        return tuple(
+            _DeferredBodyBlock(
+                item.page_idx,
+                _RhythmItem(
+                    rect=fitz.Rect(item.source_rect),
+                    text=item.text,
+                    font_path=item.font_path,
+                    font_size=item.font_size,
+                    line_height=1.05,
+                    align=item.align,
+                    redaction_rects=tuple(
+                        fitz.Rect(rect) for rect in item.target_rects
+                    )
+                    or (
+                        (fitz.Rect(item.target_rect),)
+                        if item.target_rect is not None
+                        else ()
+                    ),
+                    deferred=True,
+                ),
+            )
+            for item in raw_items
+        )
+
     mono_document = fitz.open(str(translated_path))
     try:
+        source_page_count = mono_document.page_count
         target_text = "\n".join(page.get_text("text") for page in mono_document)
     finally:
         mono_document.close()
@@ -1759,6 +2595,7 @@ def restore_ocr_document_typography(
     bilingual_path = Path(bilingual_pdf) if bilingual_pdf else None
     bilingual = _DocumentRepair(0, 0, 0, 0, 0)
     bilingual_rhythm = _RhythmRepair(0, 0)
+    layout = None
     if bilingual_path is not None and bilingual_path.is_file():
         layout = detect_ocr_bilingual_layout(translated_path, bilingual_path)
         if layout is not None:
@@ -1775,15 +2612,6 @@ def restore_ocr_document_typography(
                 furniture_segments=layout.furniture_segments,
                 logical_page_factory=layout.logical_page_index,
             )
-            bilingual_rhythm = _repair_vertical_rhythm(
-                bilingual_path,
-                ocr_result=ocr_result,
-                body_font=body_font,
-                heading_font=headings.heading_font_path,
-                page_numbers=page_numbers,
-                segment_factory=layout.target_segment,
-                logical_page_factory=layout.logical_page_index,
-            )
 
     mono_rhythm = _repair_vertical_rhythm(
         translated_path,
@@ -1793,7 +2621,36 @@ def restore_ocr_document_typography(
         page_numbers=page_numbers,
         segment_factory=lambda page, _page_idx: fitz.Rect(page.rect),
         logical_page_factory=lambda page_idx: page_idx,
+        deferred_body_blocks=(
+            *mono.deferred_body_blocks,
+            *deferred_heading_blocks(headings.deferred_headings),
+        ),
     )
+    if layout is not None and bilingual_path is not None:
+        bilingual_rhythm = _repair_vertical_rhythm(
+            bilingual_path,
+            ocr_result=ocr_result,
+            body_font=body_font,
+            heading_font=headings.heading_font_path,
+            page_numbers=page_numbers,
+            segment_factory=layout.target_segment,
+            logical_page_factory=layout.logical_page_index,
+            deferred_body_blocks=(
+                *bilingual.deferred_body_blocks,
+                *deferred_heading_blocks(headings.bilingual_deferred_headings),
+            ),
+            continuation_mode=layout.mode,
+        )
+        if (
+            bilingual_rhythm.continuation_source_pages
+            != mono_rhythm.continuation_source_pages
+        ):
+            logger.warning(
+                "Mono and bilingual fixed-style pagination produced different "
+                "continuation lineage: mono=%s bilingual=%s",
+                mono_rhythm.continuation_source_pages,
+                bilingual_rhythm.continuation_source_pages,
+            )
 
     return OcrDocumentTypographyResult(
         translated_pdf_path=translated_path,
@@ -1814,6 +2671,12 @@ def restore_ocr_document_typography(
         rhythm_blocks=mono_rhythm.blocks,
         bilingual_rhythm_blocks=bilingual_rhythm.blocks,
         headings=headings,
+        continuation_pages=len(mono_rhythm.continuation_page_indices),
+        source_page_indices=(
+            mono_rhythm.source_page_indices or tuple(range(source_page_count))
+        ),
+        continuation_page_indices=mono_rhythm.continuation_page_indices,
+        continuation_source_pages=mono_rhythm.continuation_source_pages,
     )
 
 

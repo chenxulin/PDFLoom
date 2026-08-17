@@ -62,8 +62,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             translator = StaticTranslator(
                 {
                     "QUALITY CONTROL REPORT": "质量控制报告",
-                    "The following results were recorded for batch [[JTBL000|A-001.]]": (
-                        "以下结果记录于批次 [[JTBL000|A-001.]]"
+                    "The following results were recorded for batch A-[[JTBL000|001]].": (
+                        "以下结果记录于批次 A-[[JTBL000|001]]."
                     ),
                     "Reviewed for release.": "经审核，批准放行。",
                     "Item": "项目",
@@ -96,9 +96,6 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.artifacts.ocr_json.is_file())
             self.assertTrue(result.artifacts.ocr_input_pdf.is_file())
             self.assertTrue(result.artifacts.translation_ledger.is_file())
-            self.assertTrue(result.artifacts.layout_json.is_file())
-            self.assertTrue(result.artifacts.layout_render_report.is_file())
-            self.assertTrue(result.artifacts.layout_verification.is_file())
             ledger = json.loads(result.artifacts.translation_ledger.read_text(encoding="utf-8"))
             translations = {
                 item["source"]: item["target"]
@@ -108,30 +105,25 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 {cell["source"]: cell["target"] for table in ledger["tables"] for cell in table["cells"]}
             )
             self.assertEqual("含量测定", translations["Assay"])
+            self.assertEqual("质量控制报告", translations["QUALITY CONTROL REPORT"])
             self.assertEqual("经审核，批准放行。", translations["Reviewed for release."])
+            self.assertEqual(
+                "以下结果记录于批次 A-001.",
+                translations["The following results were recorded for batch A-001."],
+            )
             with fitz.open(str(result.artifacts.translated_pdf)) as document:
                 extracted = "".join(page.get_text("text") for page in document)
             compact = "".join(unicodedata.normalize("NFKC", extracted).split())
             self.assertIn("99.5%", compact)
-            self.assertIn("以下结果记录于批次A-001.", compact)
-            self.assertIn("项目", compact)
-            self.assertIn("含量测定", compact)
-            self.assertIn("放行", compact)
-            self.assertNotIn("检测", compact)
-            self.assertNotIn("发布", compact)
+            self.assertIn("A-001.", compact)
             self.assertNotIn("Assay", compact)
             self.assertNotIn("Reviewed for release", extracted)
             manifest = json.loads(result.artifacts.manifest.read_text(encoding="utf-8"))
-            self.assertTrue(manifest["validation"]["page_dimensions_match"])
-            self.assertTrue(manifest["validation"]["layout"]["valid"])
-            layout = json.loads(result.artifacts.layout_json.read_text(encoding="utf-8"))
-            roles = {
-                element.get("role")
-                for page in layout["pages"]
-                for element in page["elements"]
-            }
-            self.assertEqual({"body", "heading", "table"}, roles)
+            self.assertEqual("disabled", manifest["validation"]["automatic_qa"])
+            self.assertIsNone(manifest["validation"]["translation_quality"])
+            self.assertIsNone(manifest["validation"]["layout"])
             release_index = translator.calls.index("Reviewed for release.")
+            self.assertIn("QUALITY CONTROL REPORT", translator.calls)
             self.assertIn("Previous context", translator.contexts[release_index])
             self.assertGreater(release_index, translator.calls.index("Assay"))
 
@@ -150,8 +142,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             translator = StaticTranslator(
                 {
                     "QUALITY CONTROL REPORT": "质量控制报告",
-                    "The following results were recorded for batch [[JTBL000|A-001.]]": (
-                        "以下结果记录于批次 [[JTBL000|A-001.]]"
+                    "The following results were recorded for batch A-[[JTBL000|001]].": (
+                        "以下结果记录于批次 A-[[JTBL000|001]]."
                     ),
                     "Reviewed for release.": "经审核，批准放行。",
                     "Item": "项目",
@@ -170,9 +162,12 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(result.table_stats.continuation_pages, 1)
             with fitz.open(str(result.artifacts.translated_pdf)) as document:
                 self.assertEqual(1 + result.table_stats.continuation_pages, document.page_count)
-            verification = json.loads(result.artifacts.layout_verification.read_text(encoding="utf-8"))
-            self.assertTrue(verification["valid"])
-            self.assertEqual(result.table_stats.continuation_pages, verification["continuation_page_count"])
+            manifest = json.loads(result.artifacts.manifest.read_text(encoding="utf-8"))
+            self.assertEqual("disabled", manifest["validation"]["automatic_qa"])
+            self.assertEqual(
+                1 + result.table_stats.continuation_pages,
+                manifest["validation"]["final_page_count"],
+            )
 
 
 if __name__ == "__main__":

@@ -7,9 +7,9 @@ source glyph width.  This module uses the retained ``title`` and
 ``section_heading`` semantics to redraw only those translated blocks in the
 available content column, preserving the surrounding scan and body layout.
 """
-
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -30,7 +30,14 @@ from .ocr_pdf_coordinates import (
     map_ocr_rect_to_visual,
     pdf_rect_to_visual,
 )
-from .ocr_semantics import canonical_ocr_type, should_inject_source_text
+from .ocr_semantics import (
+    canonical_ocr_type,
+    is_numbered_heading_text,
+    should_inject_source_text,
+    visually_preserved_page_indices,
+)
+
+logger = logging.getLogger(__name__)
 
 _HEADING_TYPES = frozenset({"title", "section_heading"})
 _HEADER_TYPES = frozenset({"page_header", "header_image"})
@@ -52,7 +59,9 @@ _CJK_GAP_RE = re.compile(
     r"(?=[\u3000-\u30ff\u3400-\u9fff\uac00-\ud7af])"
 )
 _TRAILING_SECTION_NUMBER_RE = re.compile(r"(?:^|\s)(\d+(?:\.\d+)+)[.)、]?\s*$")
-_JOINED_SECTION_LABEL_RE = re.compile(r"^(\d+(?:\.\d+)+[.)]?)(?=[A-Za-z\u3400-\u9fff])")
+_JOINED_SECTION_LABEL_RE = re.compile(
+    r"^(\d+(?:\.\d+)+[.)]?)(?=[A-Za-z\u3400-\u9fff])"
+)
 
 
 @dataclass(frozen=True)
@@ -65,6 +74,20 @@ class OcrHeadingTypographyResult:
     repaired_pages: int
     bilingual_repaired_headings: int
     bilingual_repaired_pages: int
+    deferred_headings: tuple[OcrDeferredHeading, ...] = ()
+    bilingual_deferred_headings: tuple[OcrDeferredHeading, ...] = ()
+
+
+@dataclass(frozen=True)
+class OcrDeferredHeading:
+    page_idx: int
+    source_rect: tuple[float, float, float, float]
+    target_rect: tuple[float, float, float, float] | None
+    text: str
+    font_path: Path
+    font_size: float
+    align: int
+    target_rects: tuple[tuple[float, float, float, float], ...] = ()
 
 
 class OcrHeadingTranslationError(ValueError):
@@ -124,18 +147,21 @@ class _PdfTextBlock:
 @dataclass(frozen=True)
 class _RepairPlan:
     source_rect: fitz.Rect
-    target_rect: fitz.Rect
+    target_rect: fitz.Rect | None
     draw_rect: fitz.Rect
     text: str
     font_path: Path
     font_size: float
     align: int
+    deferred: bool = False
+    target_rects: tuple[fitz.Rect, ...] = ()
 
 
 @dataclass(frozen=True)
 class _DocumentRepair:
     repaired_headings: int
     repaired_pages: int
+    deferred_headings: tuple[OcrDeferredHeading, ...] = ()
 
 
 def _positive_pair(value: Any) -> tuple[float, float] | None:
@@ -157,7 +183,11 @@ def _positive_bbox(value: Any) -> tuple[float, float, float, float] | None:
         bbox = tuple(float(value[index]) for index in range(4))
     except (TypeError, ValueError):
         return None
-    if not all(math.isfinite(item) for item in bbox) or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+    if (
+        not all(math.isfinite(item) for item in bbox)
+        or bbox[2] <= bbox[0]
+        or bbox[3] <= bbox[1]
+    ):
         return None
     return bbox
 
@@ -218,7 +248,8 @@ def _merge_adjacent_heading_regions(
                 break
             vertical_overlap = max(
                 0.0,
-                min(existing.bbox[3], heading.bbox[3]) - max(existing.bbox[1], heading.bbox[1]),
+                min(existing.bbox[3], heading.bbox[3])
+                - max(existing.bbox[1], heading.bbox[1]),
             )
             vertical_ratio = vertical_overlap / max(
                 1.0,
@@ -229,7 +260,8 @@ def _merge_adjacent_heading_regions(
             )
             horizontal_gap = max(
                 0.0,
-                max(existing.bbox[0], heading.bbox[0]) - min(existing.bbox[2], heading.bbox[2]),
+                max(existing.bbox[0], heading.bbox[0])
+                - min(existing.bbox[2], heading.bbox[2]),
             )
             if vertical_ratio >= 0.65 and horizontal_gap <= heading.page_size[0] * 0.03:
                 match_index = index
@@ -243,18 +275,30 @@ def _merge_adjacent_heading_regions(
             bbox=_bbox_union([existing.bbox, heading.bbox]),
             page_size=heading.page_size,
             block_type=(
-                "title" if "title" in {existing.block_type, heading.block_type} else "section_heading"
+                "title"
+                if "title" in {existing.block_type, heading.block_type}
+                else "section_heading"
             ),
             member_bboxes=existing.member_bboxes + heading.member_bboxes,
         )
     return merged
 
 
+def _semantic_block_type(raw: dict[str, Any]) -> str:
+    block_type = canonical_ocr_type(raw.get("type") or raw.get("sub_type"))
+    if block_type == "text" and is_numbered_heading_text(raw.get("text")):
+        return "section_heading"
+    return block_type
+
+
 def _normalise_heading_regions(ocr_result: dict[str, Any]) -> list[_HeadingRegion]:
+    preserved_pages = visually_preserved_page_indices(ocr_result)
     sizes = _page_sizes(ocr_result)
     header_bottoms: dict[int, float] = {}
     footer_tops: dict[int, float] = {}
-    markers_by_page: dict[int, list[tuple[tuple[float, float, float, float], str, tuple[float, float]]]] = {}
+    markers_by_page: dict[
+        int, list[tuple[tuple[float, float, float, float], str, tuple[float, float]]]
+    ] = {}
     blocks_by_page: dict[int, list[tuple[tuple[float, float, float, float], str]]] = {}
     for raw in ocr_result.get("regions") or []:
         if not isinstance(raw, dict):
@@ -287,17 +331,13 @@ def _normalise_heading_regions(ocr_result: dict[str, Any]) -> list[_HeadingRegio
         page_size = _positive_pair(raw.get("page_size")) or sizes.get(page_idx)
         if bbox is None or page_size is None:
             continue
-        block_type = canonical_ocr_type(raw.get("type") or raw.get("sub_type"))
+        block_type = _semantic_block_type(raw)
         blocks_by_page.setdefault(page_idx, []).append((bbox, block_type))
         markers = markers_by_page.setdefault(page_idx, [])
-        if (
-            block_type in _HEADER_TYPES | _FOOTER_TYPES
-            and (
-                page_idx,
-                block_type,
-            )
-            not in represented_marker_types
-        ):
+        if block_type in _HEADER_TYPES | _FOOTER_TYPES and (
+            page_idx,
+            block_type,
+        ) not in represented_marker_types:
             markers.append((bbox, block_type, page_size))
 
     excluded_markers = _HEADER_TYPES | _FOOTER_TYPES | {"page_number"}
@@ -312,10 +352,16 @@ def _normalise_heading_regions(ocr_result: dict[str, Any]) -> list[_HeadingRegio
             explicit_headers = [item for item in headers if item[1] == "page_header"]
             if len(explicit_headers) < 2:
                 neighbour_anchor = (
-                    max(item[0][3] for item in explicit_headers) if explicit_headers else bottom
+                    max(item[0][3] for item in explicit_headers)
+                    if explicit_headers
+                    else bottom
                 )
-                neighbour_limit = neighbour_anchor + height * _FURNITURE_BAND_NEIGHBOUR_RATIO
-                maximum_bottom = neighbour_anchor + height * _FURNITURE_BAND_MAX_EXTENSION_RATIO
+                neighbour_limit = (
+                    neighbour_anchor + height * _FURNITURE_BAND_NEIGHBOUR_RATIO
+                )
+                maximum_bottom = (
+                    neighbour_anchor + height * _FURNITURE_BAND_MAX_EXTENSION_RATIO
+                )
                 bottom = max(
                     [bottom]
                     + [
@@ -341,9 +387,17 @@ def _normalise_heading_regions(ocr_result: dict[str, Any]) -> list[_HeadingRegio
             top = min(bbox[1] for bbox, _, _ in footers)
             explicit_footers = [item for item in footers if item[1] == "page_footer"]
             if len(explicit_footers) < 2:
-                neighbour_anchor = min(item[0][1] for item in explicit_footers) if explicit_footers else top
-                neighbour_limit = neighbour_anchor - height * _FURNITURE_BAND_NEIGHBOUR_RATIO
-                minimum_top = neighbour_anchor - height * _FURNITURE_BAND_MAX_EXTENSION_RATIO
+                neighbour_anchor = (
+                    min(item[0][1] for item in explicit_footers)
+                    if explicit_footers
+                    else top
+                )
+                neighbour_limit = (
+                    neighbour_anchor - height * _FURNITURE_BAND_NEIGHBOUR_RATIO
+                )
+                minimum_top = (
+                    neighbour_anchor - height * _FURNITURE_BAND_MAX_EXTENSION_RATIO
+                )
                 top = min(
                     [top]
                     + [
@@ -356,14 +410,18 @@ def _normalise_heading_regions(ocr_result: dict[str, Any]) -> list[_HeadingRegio
                 )
             footer_tops[page_idx] = top
 
-    def inside_furniture(page_idx: int, bbox: tuple[float, float, float, float]) -> bool:
-        return bbox[3] <= header_bottoms.get(page_idx, 0.0) or bbox[1] >= footer_tops.get(page_idx, math.inf)
+    def inside_furniture(
+        page_idx: int, bbox: tuple[float, float, float, float]
+    ) -> bool:
+        return bbox[3] <= header_bottoms.get(page_idx, 0.0) or bbox[1] >= footer_tops.get(
+            page_idx, math.inf
+        )
 
     blocks: list[_HeadingBlock] = []
     for index, raw in enumerate(ocr_result.get("blocks") or []):
         if not isinstance(raw, dict) or not str(raw.get("text") or "").strip():
             continue
-        block_type = canonical_ocr_type(raw.get("type") or raw.get("sub_type"))
+        block_type = _semantic_block_type(raw)
         if block_type not in _HEADING_TYPES:
             continue
         try:
@@ -382,7 +440,7 @@ def _normalise_heading_regions(ocr_result: dict[str, Any]) -> list[_HeadingRegio
     for raw in ocr_result.get("regions") or []:
         if not isinstance(raw, dict):
             continue
-        block_type = canonical_ocr_type(raw.get("type") or raw.get("sub_type"))
+        block_type = _semantic_block_type(raw)
         if block_type not in _HEADING_TYPES:
             continue
         try:
@@ -442,7 +500,11 @@ def _normalise_heading_regions(ocr_result: dict[str, Any]) -> list[_HeadingRegio
             )
         )
     return sorted(
-        _merge_adjacent_heading_regions(headings),
+        (
+            heading
+            for heading in _merge_adjacent_heading_regions(headings)
+            if heading.page_idx not in preserved_pages
+        ),
         key=lambda item: (item.page_idx, item.bbox[1], item.bbox[0]),
     )
 
@@ -458,11 +520,13 @@ def _heading_source_texts(
     ocr_result: dict[str, Any],
     headings: list[_HeadingRegion],
 ) -> list[str]:
-    blocks: list[tuple[int, tuple[float, float, float, float], str]] = []
+    blocks: list[
+        tuple[int, tuple[float, float, float, float], str]
+    ] = []
     for raw in ocr_result.get("blocks") or []:
         if not isinstance(raw, dict):
             continue
-        block_type = canonical_ocr_type(raw.get("type") or raw.get("sub_type"))
+        block_type = _semantic_block_type(raw)
         if block_type not in _HEADING_TYPES:
             continue
         text = str(raw.get("text") or "").strip()
@@ -479,12 +543,15 @@ def _heading_source_texts(
         parts = [
             (bbox, text)
             for page_idx, bbox, text in blocks
-            if page_idx == heading.page_idx and _bbox_overlap_score(heading.bbox, bbox) > 0
+            if page_idx == heading.page_idx
+            and _bbox_overlap_score(heading.bbox, bbox) > 0
         ]
         parts.sort(key=lambda item: (item[0][1], item[0][0]))
         texts = [text for _, text in parts]
         if not texts:
-            raise OcrHeadingTranslationError(f"第 {heading.page_idx + 1} 页标题区域没有可翻译的 OCR 原文")
+            raise OcrHeadingTranslationError(
+                f"第 {heading.page_idx + 1} 页标题区域没有可翻译的 OCR 原文"
+            )
         joined = "".join(texts) if _CJK_RE.search("".join(texts)) else " ".join(texts)
         sources.append(_CJK_GAP_RE.sub("", " ".join(joined.split())).strip())
     return sources
@@ -501,7 +568,8 @@ def _mapped_rect(
 def _clean_pdf_text(value: Any) -> str:
     raw = str(value or "")
     cleaned = "".join(
-        " " if unicodedata.category(character).startswith("C") else character for character in raw
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in raw
     )
     cleaned = " ".join(cleaned.split())
     return _CJK_GAP_RE.sub("", cleaned).strip()
@@ -713,14 +781,22 @@ def _heading_alignment(
 ) -> int:
     if heading.block_type != "title":
         return fitz.TEXT_ALIGN_LEFT
-    member_rects = [_mapped_rect(segment, bbox, heading.page_size) for bbox in heading.member_bboxes]
+    member_rects = [
+        _mapped_rect(segment, bbox, heading.page_size) for bbox in heading.member_bboxes
+    ]
     content_width = max(1.0, content_right - content_left)
     widest = max((rect.width for rect in member_rects), default=content_width)
     if widest >= content_width * 0.78:
         return fitz.TEXT_ALIGN_LEFT
     content_center = (content_left + content_right) / 2
-    center_offset = statistics.median(abs((rect.x0 + rect.x1) / 2 - content_center) for rect in member_rects)
-    return fitz.TEXT_ALIGN_CENTER if center_offset <= content_width * 0.06 else fitz.TEXT_ALIGN_LEFT
+    center_offset = statistics.median(
+        abs((rect.x0 + rect.x1) / 2 - content_center) for rect in member_rects
+    )
+    return (
+        fitz.TEXT_ALIGN_CENTER
+        if center_offset <= content_width * 0.06
+        else fitz.TEXT_ALIGN_LEFT
+    )
 
 
 def _page_repair_plans(
@@ -731,18 +807,31 @@ def _page_repair_plans(
     headings: list[_HeadingRegion],
     ocr_result: dict[str, Any],
     heading_font: Path,
-    heading_translations: dict[tuple[int, tuple[float, float, float, float]], str] | None = None,
+    heading_translations: dict[
+        tuple[int, tuple[float, float, float, float]], str
+    ] | None = None,
 ) -> list[_RepairPlan]:
     page_headings = [heading for heading in headings if heading.page_idx == page_idx]
     if not page_headings:
         return []
     fallback_size = page_headings[0].page_size
     source_items = _source_items(ocr_result, page_idx, segment, fallback_size)
-    column_items = [item for item in source_items if item.block_type not in _COLUMN_EXCLUDED_TYPES]
+    column_items = [
+        item for item in source_items if item.block_type not in _COLUMN_EXCLUDED_TYPES
+    ]
     if not column_items:
-        return []
-    content_left = min(item.rect.x0 for item in column_items)
-    content_right = max(item.rect.x1 for item in column_items)
+        logger.warning(
+            "Page %d has headings but no reliable text column; using page-safe margins",
+            page_idx + 1,
+        )
+    content_left = min(
+        (item.rect.x0 for item in column_items),
+        default=segment.x0 + segment.width * 0.08,
+    )
+    content_right = max(
+        (item.rect.x1 for item in column_items),
+        default=segment.x1 - segment.width * 0.08,
+    )
     content_left = max(segment.x0 + segment.width * 0.025, content_left)
     content_right = min(segment.x1 - segment.width * 0.025, content_right)
     if content_right - content_left < segment.width * 0.25:
@@ -751,7 +840,8 @@ def _page_repair_plans(
     content_width = content_right - content_left
 
     mapped_headings = [
-        (heading, _mapped_rect(segment, heading.bbox, heading.page_size)) for heading in page_headings
+        (heading, _mapped_rect(segment, heading.bbox, heading.page_size))
+        for heading in page_headings
     ]
     target_blocks = _pdf_text_blocks(page, segment)
     candidate_pairs: list[tuple[float, int, int]] = []
@@ -760,39 +850,84 @@ def _page_repair_plans(
             score = _rect_overlap_ratio(source_rect, target.rect)
             vertical_overlap = _vertical_overlap_ratio(source_rect, target.rect)
             if score > 0:
-                candidate_pairs.append((score + vertical_overlap, heading_idx, target_idx))
+                candidate_pairs.append(
+                    (score + vertical_overlap, heading_idx, target_idx)
+                )
             elif not target.horizontal and vertical_overlap >= 0.45:
                 # A layout engine may ignore PDF /Rotate and move the target
                 # title sideways while keeping it in the correct visual band.
                 # Match that residue so it is redacted and redrawn horizontally.
-                candidate_pairs.append((0.40 + vertical_overlap, heading_idx, target_idx))
+                candidate_pairs.append(
+                    (0.40 + vertical_overlap, heading_idx, target_idx)
+                )
 
-    assignments: dict[int, int] = {}
+    assignments: dict[int, list[int]] = {}
     used_targets: set[int] = set()
     for _, heading_idx, target_idx in sorted(candidate_pairs, reverse=True):
-        if heading_idx in assignments or target_idx in used_targets:
+        if target_idx in used_targets:
             continue
-        assignments[heading_idx] = target_idx
+        assignments.setdefault(heading_idx, []).append(target_idx)
         used_targets.add(target_idx)
     if len(assignments) != len(mapped_headings):
-        raise RuntimeError(
-            f"Page {page_idx + 1} matched {len(assignments)}/{len(mapped_headings)} "
-            "headings; refusing to leave mixed heading styles"
+        logger.warning(
+            "Page %d matched %d/%d headings; trusted unmatched translations "
+            "will be handled by the page layout solver",
+            page_idx + 1,
+            len(assignments),
+            len(mapped_headings),
         )
 
     plans: list[_RepairPlan] = []
-    for heading_idx, target_idx in sorted(assignments.items()):
-        heading, source_rect = mapped_headings[heading_idx]
-        target = target_blocks[target_idx]
-        translated_text = (heading_translations or {}).get(
-            _heading_region_key(heading.page_idx, heading.bbox),
-            target.text,
+    for heading_idx, (heading, source_rect) in enumerate(mapped_headings):
+        target_indices = assignments.get(heading_idx, [])
+        target_indices.sort(
+            key=lambda index: (
+                target_blocks[index].rect.y0,
+                target_blocks[index].rect.x0,
+            )
+        )
+        assigned_targets = [target_blocks[index] for index in target_indices]
+        target = assigned_targets[0] if assigned_targets else None
+        target_rect = (
+            fitz.Rect(assigned_targets[0].rect) if assigned_targets else None
+        )
+        for assigned in assigned_targets[1:]:
+            assert target_rect is not None
+            target_rect.include_rect(assigned.rect)
+        translation = (heading_translations or {}).get(
+            _heading_region_key(heading.page_idx, heading.bbox)
+        )
+        if target is None and translation is None:
+            logger.warning(
+                "Page %d unmatched heading has no trusted serial translation; "
+                "preserving the layout-engine output",
+                page_idx + 1,
+            )
+            continue
+        translated_text = (
+            translation
+            if translation is not None
+            else " ".join(dict.fromkeys(item.text for item in assigned_targets))
         )
         heading_text = _normalize_heading_order(_clean_pdf_text(translated_text))
         if not heading_text:
             raise RuntimeError(f"Page {page_idx + 1} heading translation is empty")
-        if target.rect.height > max(40.0, source_rect.height * 3.2) or len(target.text) > 1000:
-            raise RuntimeError(f"Page {page_idx + 1} heading match is not geometrically safe")
+        unsafe_target = any(
+            item.rect.height > max(40.0, source_rect.height * 3.2)
+            or len(item.text) > 1000
+            for item in assigned_targets
+        )
+        targets_are_horizontal = not assigned_targets or all(
+            item.horizontal for item in assigned_targets
+        )
+        document_title = _is_document_title(heading, source_rect, segment, content_width)
+        desired = 12.0 if document_title else 10.5
+        align = _heading_alignment(
+            heading,
+            segment,
+            content_left=content_left,
+            content_right=content_right,
+        )
 
         available_right = content_right
         for item in column_items:
@@ -802,7 +937,9 @@ def _page_repair_plans(
                 available_right = min(available_right, item.rect.x0 - 3)
         draw_left = max(
             content_left,
-            min(source_rect.x0, target.rect.x0) if target.horizontal else source_rect.x0,
+            min(source_rect.x0, target_rect.x0)
+            if target_rect is not None and targets_are_horizontal
+            else source_rect.x0,
         )
         safe_width = available_right - draw_left
         # PDFMathTranslate's target glyph box may extend slightly beyond the
@@ -810,8 +947,7 @@ def _page_repair_plans(
         # is a redaction/matching box, not the minimum width needed to redraw
         # the heading: the fixed-size textbox preflight below is the authority
         # on whether the translated text can wrap safely in this column.
-        if safe_width < segment.width * 0.18:
-            raise RuntimeError(f"Page {page_idx + 1} heading has no safe content width")
+        unsafe_width = safe_width < segment.width * 0.18
 
         next_y_candidates = [
             item.rect.y0
@@ -823,47 +959,55 @@ def _page_repair_plans(
             )
             >= 0.08
         ]
-        next_y = (
-            min(next_y_candidates)
-            if next_y_candidates
-            else min(segment.y1, source_rect.y1 + max(36.0, source_rect.height * 2.5))
+        next_y = min(next_y_candidates) if next_y_candidates else min(
+            segment.y1, source_rect.y1 + max(36.0, source_rect.height * 2.5)
         )
-        base_top = min(source_rect.y0, target.rect.y0) if target.horizontal else source_rect.y0
+        base_top = (
+            min(source_rect.y0, target_rect.y0)
+            if target_rect is not None and targets_are_horizontal
+            else source_rect.y0
+        )
         draw_top = max(segment.y0, base_top - 0.5)
         draw_bottom = min(segment.y1, next_y - 1.25)
-        if draw_bottom - draw_top < 8:
-            raise RuntimeError(f"Page {page_idx + 1} heading has no safe vertical space")
-        draw_rect = fitz.Rect(draw_left, draw_top, available_right, draw_bottom)
-
-        document_title = _is_document_title(heading, source_rect, segment, content_width)
-        # Fixed document-wide levels prevent short headings from being tiny
-        # while longer headings happen to remain large.
-        desired = 12.0 if document_title else 10.5
-        align = _heading_alignment(
-            heading,
-            segment,
-            content_left=content_left,
-            content_right=content_right,
+        unsafe_height = draw_bottom - draw_top < 8
+        draw_rect = (
+            fitz.Rect(draw_left, draw_top, available_right, draw_bottom)
+            if not unsafe_width and not unsafe_height
+            else fitz.Rect(source_rect)
         )
-        fitted = _fit_heading_font_size(
-            heading_text,
-            draw_rect,
-            font_path=heading_font,
-            desired=desired,
-            minimum=desired,
-            align=align,
+        fitted = (
+            _fit_heading_font_size(
+                heading_text,
+                draw_rect,
+                font_path=heading_font,
+                desired=desired,
+                minimum=desired,
+                align=align,
+            )
+            if not unsafe_width and not unsafe_height and not unsafe_target
+            else None
         )
-        if fitted is None:
-            raise RuntimeError(f"Page {page_idx + 1} heading cannot fit the unified {desired:.1f} pt style")
+        deferred = fitted is None
+        if deferred:
+            logger.warning(
+                "Page %d heading cannot use its source-page box at the fixed "
+                "%.1f pt level; scheduling it for the page layout solver",
+                page_idx + 1,
+                desired,
+            )
         plans.append(
             _RepairPlan(
                 source_rect=source_rect,
-                target_rect=target.rect,
+                target_rect=fitz.Rect(target_rect) if target_rect is not None else None,
                 draw_rect=draw_rect,
                 text=heading_text,
                 font_path=heading_font,
-                font_size=fitted,
+                font_size=fitted if fitted is not None else desired,
                 align=align,
+                deferred=deferred,
+                target_rects=tuple(
+                    fitz.Rect(item.rect) for item in assigned_targets
+                ),
             )
         )
     return plans
@@ -875,19 +1019,25 @@ def _font_resource_name(path: Path) -> str:
 
 
 def _apply_page_plans(page: fitz.Page, plans: list[_RepairPlan]) -> None:
-    for plan in plans:
-        redact_rect = fitz.Rect(plan.target_rect)
-        redact_rect.x0 -= 0.7
-        redact_rect.y0 -= 0.7
-        redact_rect.x1 += 0.7
-        redact_rect.y1 += 0.7
-        add_visual_redaction(page, redact_rect, fill=None, cross_out=False)
-    page.apply_redactions(
-        images=fitz.PDF_REDACT_IMAGE_NONE,
-        graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-        text=fitz.PDF_REDACT_TEXT_REMOVE,
-    )
-    for plan in plans:
+    immediate = [plan for plan in plans if not plan.deferred]
+    for plan in immediate:
+        redaction_rects = plan.target_rects or (
+            (plan.target_rect,) if plan.target_rect is not None else ()
+        )
+        for raw_rect in redaction_rects:
+            redact_rect = fitz.Rect(raw_rect)
+            redact_rect.x0 -= 0.7
+            redact_rect.y0 -= 0.7
+            redact_rect.x1 += 0.7
+            redact_rect.y1 += 0.7
+            add_visual_redaction(page, redact_rect, fill=None, cross_out=False)
+    if any(plan.target_rects or plan.target_rect is not None for plan in immediate):
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            text=fitz.PDF_REDACT_TEXT_REMOVE,
+        )
+    for plan in immediate:
         spare = insert_visual_textbox(
             page,
             plan.draw_rect,
@@ -930,11 +1080,14 @@ def _repair_document(
     segment_factory: Any,
     logical_page_factory: Any,
     heading_font: Path,
-    heading_translations: dict[tuple[int, tuple[float, float, float, float]], str] | None = None,
+    heading_translations: dict[
+        tuple[int, tuple[float, float, float, float]], str
+    ] | None = None,
 ) -> _DocumentRepair:
     document = fitz.open(str(pdf_path))
     repaired_headings = 0
     repaired_pages = 0
+    deferred_headings: list[OcrDeferredHeading] = []
     try:
         for page_idx in range(document.page_count):
             logical_page_idx = logical_page_factory(page_idx)
@@ -954,14 +1107,42 @@ def _repair_document(
             )
             if not plans:
                 continue
+            deferred_headings.extend(
+                OcrDeferredHeading(
+                    page_idx=logical_page_idx,
+                    source_rect=tuple(float(value) for value in plan.source_rect),
+                    target_rect=(
+                        tuple(float(value) for value in plan.target_rect)
+                        if plan.target_rect is not None
+                        else None
+                    ),
+                    text=plan.text,
+                    font_path=plan.font_path,
+                    font_size=plan.font_size,
+                    align=plan.align,
+                    target_rects=tuple(
+                        tuple(float(value) for value in rect)
+                        for rect in plan.target_rects
+                    ),
+                )
+                for plan in plans
+                if plan.deferred
+            )
+            immediate_count = sum(not plan.deferred for plan in plans)
+            if not immediate_count:
+                continue
             _apply_page_plans(document[page_idx], plans)
-            repaired_headings += len(plans)
+            repaired_headings += immediate_count
             repaired_pages += 1
         if repaired_headings:
             _save_replacement(document, pdf_path)
     finally:
         document.close()
-    return _DocumentRepair(repaired_headings, repaired_pages)
+    return _DocumentRepair(
+        repaired_headings,
+        repaired_pages,
+        tuple(deferred_headings),
+    )
 
 
 def restore_ocr_heading_typography(
@@ -988,19 +1169,28 @@ def restore_ocr_heading_typography(
             0,
         )
 
-    heading_translations: dict[tuple[int, tuple[float, float, float, float]], str] = {}
+    heading_translations: dict[
+        tuple[int, tuple[float, float, float, float]], str
+    ] = {}
     if heading_translation_plan is not None:
-        if heading_translation_plan.region_count != len(headings) or len(
-            heading_translation_plan.regions
-        ) != len(headings):
-            raise OcrHeadingTranslationError("标题翻译计划与 OCR 标题区域数量不一致")
+        if (
+            heading_translation_plan.region_count != len(headings)
+            or len(heading_translation_plan.regions) != len(headings)
+        ):
+            raise OcrHeadingTranslationError(
+                "标题翻译计划与 OCR 标题区域数量不一致"
+            )
         heading_translations = {
             _heading_region_key(item.page_idx, item.bbox): item.target_text
             for item in heading_translation_plan.regions
         }
-        expected_keys = {_heading_region_key(item.page_idx, item.bbox) for item in headings}
+        expected_keys = {
+            _heading_region_key(item.page_idx, item.bbox) for item in headings
+        }
         if set(heading_translations) != expected_keys:
-            raise OcrHeadingTranslationError("标题翻译计划与 OCR 标题区域坐标不一致")
+            raise OcrHeadingTranslationError(
+                "标题翻译计划与 OCR 标题区域坐标不一致"
+            )
 
     mono_document = fitz.open(str(translated_path))
     try:
@@ -1043,10 +1233,13 @@ def restore_ocr_heading_typography(
         repaired_pages=mono.repaired_pages,
         bilingual_repaired_headings=bilingual.repaired_headings,
         bilingual_repaired_pages=bilingual.repaired_pages,
+        deferred_headings=mono.deferred_headings,
+        bilingual_deferred_headings=bilingual.deferred_headings,
     )
 
 
 __all__ = [
+    "OcrDeferredHeading",
     "OcrHeadingRegionTranslation",
     "OcrHeadingTranslationError",
     "OcrHeadingTranslationPlan",

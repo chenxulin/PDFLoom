@@ -31,8 +31,8 @@ app = FastAPI(
     title="OCR PDF Agent",
     version="0.1.0",
     description=(
-        "PaddleOCR + PDFMathTranslate + serial LLM + layout-preserving rendering "
-        "+ vector-table redraw service"
+        "PaddleOCR + PDFMathTranslate v1 + serial LLM + typography and "
+        "vector-table redraw service"
     ),
     lifespan=lifespan,
 )
@@ -158,9 +158,6 @@ async def get_artifact(job_id: str, artifact_name: str) -> FileResponse:
         "ocr": "ocr_ppstructurev3.json",
         "ocr-input": "ocr_pdfmathtranslate_input.pdf",
         "ledger": "translation_ledger.json",
-        "layout": "layout.json",
-        "layout-render-report": "layout_render_report.json",
-        "layout-verification": "layout_verification.json",
         "source": "source.pdf",
     }
     filename = allowed.get(artifact_name)

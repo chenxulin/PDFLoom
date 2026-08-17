@@ -100,9 +100,6 @@ class PipelineArtifacts:
     ocr_json: Path | None = None
     ocr_input_pdf: Path | None = None
     translation_ledger: Path | None = None
-    layout_json: Path | None = None
-    layout_render_report: Path | None = None
-    layout_verification: Path | None = None
 
 
 @dataclass(frozen=True)

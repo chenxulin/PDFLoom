@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -19,11 +20,6 @@ import fitz
 
 from .classifier import classify_pdf
 from .config import Settings
-from .layout_preserving import (
-    generate_layout_from_ledger,
-    render_layout_pdf,
-    verify_layout_output,
-)
 from .llm import Translator
 from .models import (
     BodyRedrawStats,
@@ -36,7 +32,7 @@ from .models import (
 from .ocr_client import PaddleOcrClient
 from .ocr_document_typography import OcrBodyTranslationPlan, restore_ocr_document_typography
 from .ocr_heading_typography import OcrHeadingTranslationPlan
-from .ocr_layer import build_ocr_source_pdf
+from .ocr_searchable_pdf import build_ocr_searchable_pdf
 from .ocr_serial_translation import translate_ocr_content_serially
 from .ocr_table_redraw import OcrTableTranslationPlan, redraw_ocr_tables
 from .pdfmath import PdfEngine, PdfMathTranslateEngine
@@ -318,7 +314,7 @@ class PdfTranslationPipeline:
 
             mark = time.monotonic()
             emit("classify", 1.0, "Classifying every PDF page")
-            profile = classify_pdf(archived_source)
+            profile = await asyncio.to_thread(classify_pdf, archived_source)
             timings["classify"] = int((time.monotonic() - mark) * 1000)
             needs_ocr = profile.route == ProcessingRoute.PADDLEOCR_THEN_PDFMATHTRANSLATE
             self.settings.validate_for_translation(needs_ocr=needs_ocr)
@@ -348,11 +344,16 @@ class PdfTranslationPipeline:
                 emit("ocr-layer", 12.0, "Building a clean OCR source layer")
                 mark = time.monotonic()
                 ocr_input_path = destination / "ocr_pdfmathtranslate_input.pdf"
-                layer = build_ocr_source_pdf(
+                layer = await asyncio.to_thread(
+                    build_ocr_searchable_pdf,
                     archived_source,
                     ocr_input_path,
                     ocr_result,
-                    font_path=self.settings.regular_font_path,
+                    input_profile=profile.kind.value,
+                    # The standalone Agent intentionally exposes only the
+                    # stable v1 engine. Its input must therefore mask scanned
+                    # source glyphs and supply one visible OCR text layer.
+                    source_layer_mode="visible_masked",
                 )
                 engine_input = layer.pdf_path
                 timings["ocr_layer"] = int((time.monotonic() - mark) * 1000)
@@ -375,9 +376,6 @@ class PdfTranslationPipeline:
             table_stats = TableRedrawStats()
             body_stats = BodyRedrawStats()
             working_mono_pdf = engine_artifacts.mono_pdf
-            layout_json_path: Path | None = None
-            layout_render_report_path: Path | None = None
-            layout_verification_path: Path | None = None
             table_result = None
             if ocr_result is not None:
                 mark = time.monotonic()
@@ -407,11 +405,16 @@ class PdfTranslationPipeline:
                     92.0,
                     "Redrawing complete OCR paragraphs and headings with unified typography",
                 )
-                typography = restore_ocr_document_typography(
+                typography = await asyncio.to_thread(
+                    restore_ocr_document_typography,
                     ocr_result=ocr_result,
                     translated_pdf=engine_artifacts.mono_pdf,
                     bilingual_pdf=engine_artifacts.bilingual_pdf,
-                    source_pdf=archived_source,
+                    # ``build_ocr_searchable_pdf`` applies any OCR-detected
+                    # right-angle correction.  Use that same coordinate
+                    # system while restoring protected visuals and rebuilding
+                    # body typography, exactly as Joincare's scan route does.
+                    source_pdf=ocr_input_path,
                     body_translation_plan=serial.body_plan,
                     heading_translation_plan=serial.heading_plan,
                 )
@@ -425,42 +428,27 @@ class PdfTranslationPipeline:
                         serial.body_plan.protected_values + serial.heading_plan.protected_values
                     ),
                 )
-                emit(
-                    "layout-render",
-                    94.0,
-                    "Building a coordinate layout over the preserved source-page background",
-                )
-                layout_json_path = generate_layout_from_ledger(
-                    archived_source,
-                    translation_ledger_path,
-                    destination / "layout.json",
-                    background_dpi=self.settings.layout_background_dpi,
-                    body_font_size=self.settings.layout_body_font_size,
-                    body_min_font_size=self.settings.layout_body_min_font_size,
-                )
-                layout_render = render_layout_pdf(
-                    archived_source,
-                    layout_json_path,
-                    destination / "layout_preserved.pdf",
-                    regular_font_path=typography.body_font_path,
-                    bold_font_path=typography.headings.heading_font_path,
-                    report_path=destination / "layout_render_report.json",
-                )
-                working_mono_pdf = layout_render.pdf_path
-                layout_render_report_path = layout_render.report_path
                 if serial.table_plan.table_count:
                     emit(
                         "table-redraw",
                         95.0,
                         "Replacing source tables with fitted 9 pt vector tables",
                     )
-                    table_result = redraw_ocr_tables(
+                    table_result = await asyncio.to_thread(
+                        redraw_ocr_tables,
                         ocr_result=ocr_result,
                         plan=serial.table_plan,
                         translated_pdf=working_mono_pdf,
                         bilingual_pdf=engine_artifacts.bilingual_pdf,
                         body_font_path=typography.body_font_path,
-                        bold_font_path=None,
+                        bold_font_path=typography.headings.heading_font_path,
+                        source_page_indices=tuple(
+                            getattr(typography, "source_page_indices", ()) or ()
+                        ),
+                        continuation_page_indices=tuple(
+                            getattr(typography, "continuation_page_indices", ())
+                            or ()
+                        ),
                     )
                     table_stats = TableRedrawStats(
                         tables_detected=serial.table_plan.table_count,
@@ -478,7 +466,7 @@ class PdfTranslationPipeline:
                         "order": "page_reading_order_serial",
                     },
                     typography=_json_safe(asdict(typography)),
-                    layout_render=_json_safe(asdict(layout_render)),
+                    automatic_qa="disabled",
                 )
                 timings["ocr_translate_redraw"] = int((time.monotonic() - mark) * 1000)
 
@@ -492,70 +480,56 @@ class PdfTranslationPipeline:
                 if engine_artifacts.bilingual_pdf is not None
                 else None
             )
-            if layout_json_path is not None:
-                layout_verification_path = destination / "layout_verification.json"
-                source_page_indices = (
-                    table_result.source_page_indices if table_result is not None else None
+            with fitz.open(str(translated)) as document:
+                if document.page_count < 1:
+                    raise RuntimeError("Translated PDF has no pages")
+                final_page_count = document.page_count
+                final_text_characters = sum(
+                    len(page.get_text("text").strip()) for page in document
                 )
-                continuation_groups = (
-                    table_result.continuation_page_groups if table_result is not None else None
-                )
-                overlay_regions = (
-                    (
-                        (region.page_idx, region.bbox)
-                        for region in table_result.translated_overlay_regions
-                    )
-                    if table_result is not None
-                    else ()
-                )
-                repeated_headers = (
-                    table_result.repeated_header_texts if table_result is not None else ()
-                )
-                layout_verification = verify_layout_output(
-                    archived_source,
-                    layout_json_path,
-                    translated,
-                    layout_verification_path,
-                    source_page_indices=source_page_indices,
-                    continuation_page_groups=continuation_groups,
-                    extra_overlay_regions=overlay_regions,
-                    repeated_header_texts=repeated_headers,
-                    similarity_dpi=self.settings.layout_similarity_dpi,
-                    similarity_margin=self.settings.layout_similarity_margin,
-                    min_similarity=self.settings.layout_min_similarity,
-                )
-                page_dimensions_match = layout_verification.page_dimensions_match
-                final_page_count = layout_verification.output_page_count
-                with fitz.open(str(translated)) as document:
-                    final_text_characters = sum(len(page.get_text("text").strip()) for page in document)
-            else:
-                layout_verification = None
-                with fitz.open(str(archived_source)) as source_document, fitz.open(str(translated)) as document:
+
+            # Match Joincare's current scanned-PDF policy: the OCR-specific
+            # automatic quality gate is deliberately disabled. The renderer may
+            # append continuation pages for expanded prose or tables, so a
+            # source-page-count/dimension gate would reject valid deliveries.
+            page_dimensions_match: bool | None = None
+            output_quality: dict[str, Any] | None = None
+            if ocr_result is None:
+                with fitz.open(str(archived_source)) as source_document, fitz.open(
+                    str(translated)
+                ) as document:
                     if document.page_count != source_document.page_count:
-                        raise RuntimeError("Translated PDF page count differs from the uploaded PDF")
+                        raise RuntimeError(
+                            "Translated PDF page count differs from the uploaded PDF"
+                        )
                     page_dimensions_match = all(
-                        abs(document[index].rect.width - source_document[index].rect.width) <= 0.1
-                        and abs(document[index].rect.height - source_document[index].rect.height) <= 0.1
+                        abs(
+                            document[index].rect.width
+                            - source_document[index].rect.width
+                        )
+                        <= 0.1
+                        and abs(
+                            document[index].rect.height
+                            - source_document[index].rect.height
+                        )
+                        <= 0.1
                         for index in range(document.page_count)
                     )
                     if not page_dimensions_match:
-                        raise RuntimeError("Translated PDF page dimensions differ from the uploaded PDF")
-                    final_page_count = document.page_count
-                    final_text_characters = sum(len(page.get_text("text").strip()) for page in document)
-            source_text = (
-                str(ocr_result.get("markdown") or "")
-                if ocr_result is not None
-                else _pdf_text(archived_source)
-            )
-            target_text = _pdf_text(translated)
-            output_quality = _output_quality(
-                source_text,
-                target_text,
-                self.settings.target_language,
-                enforce_cmc_terminology=self.settings.enforce_cmc_terminology,
-            )
-            if self.settings.strict_output_qa and not output_quality["passed"]:
-                raise RuntimeError("Output translation QA failed: " + "; ".join(output_quality["failures"]))
+                        raise RuntimeError(
+                            "Translated PDF page dimensions differ from the uploaded PDF"
+                        )
+                output_quality = _output_quality(
+                    _pdf_text(archived_source),
+                    _pdf_text(translated),
+                    self.settings.target_language,
+                    enforce_cmc_terminology=self.settings.enforce_cmc_terminology,
+                )
+                if self.settings.strict_output_qa and not output_quality["passed"]:
+                    raise RuntimeError(
+                        "Output translation QA failed: "
+                        + "; ".join(output_quality["failures"])
+                    )
             timings["total"] = int((time.monotonic() - started) * 1000)
             artifact_data = {
                 "source_pdf": str(archived_source),
@@ -564,13 +538,8 @@ class PdfTranslationPipeline:
                 "bilingual_pdf": str(bilingual) if bilingual else None,
                 "ocr_json": str(ocr_json_path) if ocr_json_path else None,
                 "ocr_input_pdf": str(ocr_input_path) if ocr_input_path else None,
-                "translation_ledger": (str(translation_ledger_path) if translation_ledger_path else None),
-                "layout_json": str(layout_json_path) if layout_json_path else None,
-                "layout_render_report": (
-                    str(layout_render_report_path) if layout_render_report_path else None
-                ),
-                "layout_verification": (
-                    str(layout_verification_path) if layout_verification_path else None
+                "translation_ledger": (
+                    str(translation_ledger_path) if translation_ledger_path else None
                 ),
             }
             manifest.update(
@@ -593,11 +562,8 @@ class PdfTranslationPipeline:
                     "page_dimensions_match": page_dimensions_match,
                     "final_text_characters": final_text_characters,
                     "translation_quality": output_quality,
-                    "layout": (
-                        _json_safe(asdict(layout_verification))
-                        if layout_verification is not None
-                        else None
-                    ),
+                    "automatic_qa": "disabled" if ocr_result is not None else "enabled",
+                    "layout": None,
                 },
                 timings_ms=timings,
                 artifacts=artifact_data,
@@ -610,9 +576,6 @@ class PdfTranslationPipeline:
                 ocr_json=ocr_json_path,
                 ocr_input_pdf=ocr_input_path,
                 translation_ledger=translation_ledger_path,
-                layout_json=layout_json_path,
-                layout_render_report=layout_render_report_path,
-                layout_verification=layout_verification_path,
             )
             return PipelineResult(
                 job_id=identifier,

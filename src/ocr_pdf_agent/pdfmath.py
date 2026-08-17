@@ -206,8 +206,14 @@ class PdfMathTranslateEngine:
         stage_dir.mkdir(parents=True, exist_ok=False)
         staged = stage_dir / path.name
         shutil.copy2(path, staged)
+        # pdf2zh/BabelDOC otherwise attempts to download a font manifest on
+        # its first translation, even when the standalone runtime already
+        # ships Noto CJK. Reuse the Agent's configurable local font so an
+        # offline or restricted deployment can start a v1 scan job reliably.
+        local_font = self.settings.regular_font_path
         environment = {
             "HF_ENDPOINT": self.settings.pdfmathtranslate_hf_endpoint,
+            "NOTO_FONT_PATH": str(local_font) if local_font.is_file() else "",
         }
         envs = {
             "OPENAI_API_KEY": self.settings.llm_key,
