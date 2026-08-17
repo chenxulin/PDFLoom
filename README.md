@@ -12,15 +12,13 @@
 | 原始视觉证据保留 | 图片、图表、印章和签名等内容保留原始视觉呈现 |
 | 受控术语翻译 | 使用预定义术语库约束专有名称及行业术语的译法 |
 | 事实字段保护 | 保护数字、日期、单位、化学式、产品批号等关键内容 |
-|  |
-|  |
 ## 技术栈
 
 | 能力 | 实现 |
 | --- | --- |
 | 服务与配置 | Python 3.12、FastAPI、Pydantic Settings、HTTPX、asyncio |
 | PDF 与 OCR | PyMuPDF、PDFMathTranslate / pdf2zh、PaddleOCR PP-StructureV3 |
-| 翻译 | OpenAI 兼容模型接口（如 DeepSeek、Kimi、GLM 等）与独立 CMC 术语规则 |
+| 翻译 | OpenAI 兼容模型接口（如 DeepSeek、Kimi、GLM 等）与独立术语规则 |
 | 工程化 | Docker Compose、异步任务、磁盘状态、SHA-256 审计、pytest |
 
 ## 快速开始
